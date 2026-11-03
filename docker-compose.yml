@@ -13,7 +13,6 @@ services:
     restart: unless-stopped
 
   muse-connector:
-    profiles: ["muse"]
     build:
       context: ./muse-connector
     environment:

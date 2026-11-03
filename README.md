@@ -7,7 +7,7 @@
 - `huobao-drama/`：完整 Huobao Drama 上游源代码子模块，固定在 v4.0.10 对应提交。
 - `muse-connector/`：Muse MCP 服务，负责安全读取项目、写入脚本/分镜和上传生成素材。
 - `Dockerfile`：从子模块构建火宝前端与后端，并应用 Muse 分镜媒体字段补丁。
-- `docker-compose.yml`：统一编排 Huobao Drama 与可选 Muse 连接器。
+- `docker-compose.yml`：统一构建并启动 Huobao Drama 与 Muse 连接器。
 
 ## 获取完整源码
 
@@ -26,21 +26,20 @@ git submodule update --init --recursive
 
 ## 部署
 
-1. 复制 `.env.example` 为 `.env`，设置 `MUSE_BRIDGE_TOKEN` 为随机长令牌。
-2. 启动完整火宝短剧系统：
+1. 复制 `.env.example` 为 `.env`，将 `MUSE_BRIDGE_TOKEN` 改为随机长令牌。
+2. 一条 Compose 命令构建并启动火宝主应用与 Muse 连接器：
 
    ```sh
-   docker compose up -d --build app
+   docker compose up -d --build
    ```
 
-3. 打开 `http://NAS地址:5679`，创建短剧并记下其 ID；把允许 Muse 访问的剧集 ID 写入 `.env` 的 `ALLOWED_DRAMA_IDS`，多个 ID 用逗号分隔。
-4. 启动 Muse 连接器：
+3. 打开 `http://NAS地址:5679`，创建短剧并记下其 ID；把允许 Muse 访问的剧集 ID 写入 `.env` 的 `ALLOWED_DRAMA_IDS`，多个 ID 用逗号分隔。连接器默认拒绝所有未列出的剧集；更新白名单后重建连接器：
 
    ```sh
-   docker compose --profile muse up -d --build muse-connector
+   docker compose up -d --force-recreate muse-connector
    ```
 
-5. Muse MCP 地址为 `https://你的域名/huobao-muse/mcp`。经 HTTPS 反向代理或现有认证中转对外提供服务；连接器端口默认只绑定 `127.0.0.1`，不要直接暴露到公网。
+4. Muse MCP 地址为 `https://你的域名/huobao-muse/mcp`。经 HTTPS 反向代理或现有认证中转对外提供服务；连接器端口默认只绑定 `127.0.0.1`，不要直接暴露到公网。
 
 配置和工作流详见 [Muse MCP connector 文档](docs/MUSE_CONNECTOR.md)。数据保存在 Docker 卷 `huobao-data`。
 

@@ -1,6 +1,6 @@
 # Muse MCP connector
 
-The optional connector lets Muse perform model generation and write the results into Huobao Drama. It follows the ArcReel handoff pattern: Muse is the generation agent; Huobao remains the project, script, storyboard, and media store. Existing provider-based generation remains available.
+The connector lets Muse perform model generation and write the results into Huobao Drama. It follows the ArcReel handoff pattern: Muse is the generation agent; Huobao remains the project, script, storyboard, and media store. Existing provider-based generation remains available.
 
 ## Tools exposed to Muse
 
@@ -12,19 +12,19 @@ The optional connector lets Muse perform model generation and write the results 
 
 The connector does not expose arbitrary HTTP requests, deletion, AI provider credentials, or unrestricted filesystem access. Image uploads are limited to 30 MiB; video uploads are limited to 50 MiB. Uploads go through Huobao's existing media routes and are stored under its normal persistent data volume.
 
-## Start the optional service
+## Build and start the integrated Compose project
 
 1. Copy `.env.example` to `.env` if you have not already done so.
 2. Set a unique long `MUSE_BRIDGE_TOKEN` and an explicit comma-separated `ALLOWED_DRAMA_IDS`, for example `12,13`. An empty allowlist denies every drama.
-3. Start the connector:
+3. Build and start the full Compose project, including both Huobao Drama and the connector:
 
    ```sh
-   docker compose --profile muse up -d --build muse-connector
-   docker compose ps muse-connector
+   docker compose up -d --build
    ```
 
-4. Check `http://127.0.0.1:5680/health`. The health response reports configuration presence and allowlist count, never the token.
-5. Add an MCP server to Muse using the connector URL and bearer token. For a same-host deployment, the URL is `http://127.0.0.1:5680/mcp`. For Muse on another machine, expose the connector through an HTTPS reverse proxy or the existing authenticated relay and use that HTTPS `/mcp` URL. Keep the Compose bind address on loopback when the proxy runs on the same host.
+4. After creating a drama, add its ID to `ALLOWED_DRAMA_IDS` in `.env`, then recreate the connector with `docker compose up -d --force-recreate muse-connector`. An empty allowlist denies all drama access.
+5. Check `http://127.0.0.1:5680/health`. The health response reports configuration presence and allowlist count, never the token.
+6. Add an MCP server to Muse using the connector URL and bearer token. For a same-host deployment, the URL is `http://127.0.0.1:5680/mcp`. For Muse on another machine, expose the connector through an HTTPS reverse proxy or the existing authenticated relay and use that HTTPS `/mcp` URL. Keep the Compose bind address on loopback when the proxy runs on the same host.
 
 Example MCP connection settings (replace placeholders locally):
 
