@@ -1,54 +1,45 @@
-# Muse MCP connector
+# Muse MCP 连接器
 
-The connector lets Muse perform model generation and write the results into Huobao Drama. It follows the ArcReel handoff pattern: Muse is the generation agent; Huobao remains the project, script, storyboard, and media store. Existing provider-based generation remains available.
+连接器通过 Huobao Drama 已公开的 `/api/v1` 路由读写剧本、分镜和素材。所有 HTTP 路由（包括 MCP）必须携带 `Authorization: Bearer <本机配置的令牌>`；令牌缺失或不匹配返回 401。只有 `/health` 不要求令牌，响应仅包含服务状态、令牌是否配置及白名单条数，不含令牌值。
 
-## Tools exposed to Muse
+## Compose 与公网
 
-- `list_dramas`, `get_drama`, `get_episode`, and `list_storyboards` read only dramas explicitly listed in `ALLOWED_DRAMA_IDS`.
-- `update_episode_script` saves Muse-authored episode script text.
-- `update_storyboard` updates storyboard prompts and descriptive fields.
-- `upload_storyboard_media` uploads an image or video and links it to the selected storyboard field.
-- `upload_drama_asset` uploads and links character, scene, or prop images.
+根目录 `docker-compose.yml` 一次构建并启动 Huobao（5679）和连接器（5680）。连接器默认绑定 `0.0.0.0:5680`，可用 `MUSE_CONNECTOR_BIND=127.0.0.1` 改回仅本机。公网开放 5680 后，任何人都能尝试令牌；建议用防火墙或隧道只放行可信来源。务必设置长随机令牌；令牌泄露立即更换并重建连接器。不要把令牌写进仓库、提示词或日志。
 
-The connector does not expose arbitrary HTTP requests, deletion, AI provider credentials, or unrestricted filesystem access. Image uploads are limited to 30 MiB; video uploads are limited to 50 MiB. Uploads go through Huobao's existing media routes and are stored under its normal persistent data volume.
+`ALLOWED_DRAMA_IDS` 为空时默认允许全部剧；配置逗号分隔 ID 时，仅这些剧可访问。`list_dramas` 列出当前允许的剧。新建剧 ID 会登记在连接器状态卷中，配置非空白名单时也能立即访问。删除剧后会移除登记。连接器状态卷同时保存有限的重试元数据。
 
-## Build and start the integrated Compose project
+## 工具
 
-1. Copy `.env.example` to `.env` if you have not already done so.
-2. Set a unique long `MUSE_BRIDGE_TOKEN` and an explicit comma-separated `ALLOWED_DRAMA_IDS`, for example `12,13`. An empty allowlist denies every drama.
-3. Build and start the full Compose project, including both Huobao Drama and the connector:
+**剧集**：`list_dramas`、`get_drama`、`create_drama(title, description?)`、`delete_drama(drama_id)`。
 
-   ```sh
-   docker compose up -d --build
-   ```
+**集**：`get_episode`、`create_episode(drama_id,title,order?)`、`update_episode(episode_id,fields_json)`、`update_episode_script`、`delete_episode`、`list_storyboards`。
 
-4. After creating a drama, add its ID to `ALLOWED_DRAMA_IDS` in `.env`, then recreate the connector with `docker compose up -d --force-recreate muse-connector`. An empty allowlist denies all drama access.
-5. Check `http://127.0.0.1:5680/health`. The health response reports configuration presence and allowlist count, never the token.
-6. Add an MCP server to Muse using the connector URL and bearer token. For a same-host deployment, the URL is `http://127.0.0.1:5680/mcp`. For Muse on another machine, expose the connector through an HTTPS reverse proxy or the existing authenticated relay and use that HTTPS `/mcp` URL. Keep the Compose bind address on loopback when the proxy runs on the same host.
+**分镜**：`create_storyboard(episode_id,fields_json)`、`update_storyboard`、`delete_storyboard`、`upload_storyboard_media`、`delete_storyboard_media`。更新白名单涵盖标题、描述、镜头类型、角度、运镜、时长、视频/图片提示词、场景、地点、时间、氛围、结果、音乐提示词、音效及媒体字段。新建分镜只接受上游创建路由真实支持的字段。
 
-Example MCP connection settings (replace placeholders locally):
+**实体**：`create_character` / `update_character` / `delete_character`，以及 scene、prop 同类工具；`upload_drama_asset` 和 `delete_drama_asset` 管理已存在实体的图片记录。
 
-```json
-{
-  "url": "https://your-domain.example/huobao-muse/mcp",
-  "headers": {
-    "Authorization": "Bearer <MUSE_BRIDGE_TOKEN>"
-  }
-}
+**导入与校验**：`import_drama_bundle(bundle_json, drama_id?, episode_offset?)`、`verify_drama(drama_id)`。
+
+**任务**：`list_tasks(drama_id?)`、`get_task(task_id)`、`retry_task(task_id)`。任务来源是 Huobao `/tasks` 接口，当前只公开图片/视频任务；不伪造文本任务或百分比，`progress_percent` 为 `null` 并说明后端未提供。后端没有可重放的源任务参数或 retry 路由，因此 `retry_task` 会明确返回 `RETRY_UNSUPPORTED`，不会谎称重试成功。
+
+## 导入格式与分批
+
+`bundle_json` 接受用户约定的结构：`title`、`episodes[]`（`title`、`script_content`、`storyboards[]` 含 `scene_id`、`title`、`image_prompt`、`video_prompt`、`utterances`、`characters`、`scene`、`props`）以及 `assets[]`（`kind`、`name`、`filename`、`base64_data`）。可将 30 集拆为三次各 10 集调用：第一次不传 `drama_id`，保存返回 ID；后两次传同一 `drama_id`，并设置 `episode_offset` 为 10、20。按集号查重，按实体名字复用，单镜失败会保留此前成功并返回集号、镜号和原因。导入分镜次序按集内顺序生成。
+
+上游现状限制：分镜 schema 没有 `utterances` 字段，连接器报告未写入；示例 `scene_id` 字符串是调用方标签，不是数据库场景 ID，场景关联按 `scene` 名称解析。上游没有把已存在角色/场景/道具关联到新集的公开路由，因此跨集复用会在报告中提示并可能导致分镜创建被后端拒绝；连接器不会编造关联接口。逐批导入后调用 `verify_drama` 检查集数、分镜数、已挂分镜图/视频、实体数与缺图名字。
+
+## 删除语义与媒体限制
+
+删除工具会先查询关联记录，成功返回被删 ID、类型、删除前关联数量；失败返回原后端 HTTP 状态、错误码和原因。Huobao 的实体与剧/集删除使用其既有删除语义。删除分镜图/视频或实体图会把数据库记录字段清成空字符串。上游没有公开物理文件删除 API，因此响应注明 `physical_file_deleted: false`；文件可能仍留在 Huobao 存储卷中。
+
+图片大小上限 30 MiB。视频上限 100 MiB；仓库现有 `patches/storyboard-media-fields.patch` 在镜像构建时把上游上传路由限制同步提升到 100 MiB。超限错误包含实际字节数和上限。导入图片同样受 30 MiB 限制；大素材建议按需拆分资产导入调用。
+
+## 健康检查和连接
+
+```sh
+docker compose up -d --build
+curl -i http://127.0.0.1:5679/api/v1/health
+curl -i http://127.0.0.1:5680/health
 ```
 
-Do not commit the real token or put it in prompts or logs. Rotate it by changing `MUSE_BRIDGE_TOKEN` and recreating `muse-connector`.
-
-## Workflow
-
-1. Ask Muse to use `list_dramas` and read the target drama and episode.
-2. Have Muse draft or revise the script, then call `update_episode_script` to save it.
-3. Read the episode storyboards, revise their prompts/descriptions with `update_storyboard`, and generate media in Muse.
-4. Upload the completed image/video with `upload_storyboard_media`, or upload character/scene/prop images with `upload_drama_asset`.
-5. Re-read the episode in Huobao and review the saved text and attached media.
-
-For manual stage approval, configure Muse's workflow instructions to stop after each production stage and wait for your approval before continuing. The connector provides the read/write tools; it does not enforce approval gates itself.
-
-## Current integration boundary
-
-This connector provides a Muse-driven content and media handoff. It does not make the Muse desktop app callable as a provider API, and it does not yet mirror Muse runs into Huobao's `sys_task` progress panel. Existing in-app text, image, and video provider tasks continue to use their configured API providers. A later lifecycle integration can add queued/claimed/completed Muse jobs if the project needs task-level progress and retry controls.
+MCP 地址为 `http://主机:5680/mcp`。不要在仓库保存真实令牌。公网部署应以防火墙/可信来源隧道收敛访问面。
