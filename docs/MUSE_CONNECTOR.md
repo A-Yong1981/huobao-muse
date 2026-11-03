@@ -6,7 +6,7 @@
 
 根目录 `docker-compose.yml` 一次构建并启动 Huobao（5679）和连接器（5680）。连接器默认绑定 `0.0.0.0:5680`，可用 `MUSE_CONNECTOR_BIND=127.0.0.1` 改回仅本机。公网开放 5680 后，任何人都能尝试令牌；建议用防火墙或隧道只放行可信来源。务必设置长随机令牌；令牌泄露立即更换并重建连接器。不要把令牌写进仓库、提示词或日志。
 
-`ALLOWED_DRAMA_IDS` 为空时默认允许全部剧；配置逗号分隔 ID 时，仅这些剧可访问。`list_dramas` 列出当前允许的剧。新建剧 ID 会登记在连接器状态卷中，配置非空白名单时也能立即访问。删除剧后会移除登记。连接器状态卷同时保存有限的重试元数据。
+`ALLOWED_DRAMA_IDS` 为空时默认允许全部剧；配置逗号分隔 ID 时，仅这些剧可访问。`list_dramas` 列出当前允许的剧。新建剧 ID 会登记在连接器状态卷中，配置非空白名单时也能立即访问。删除剧后会移除登记。连接器状态卷保存新建剧登记和旧任务的一次重试标记。
 
 ## 工具
 
@@ -20,7 +20,7 @@
 
 **导入与校验**：`import_drama_bundle(bundle_json, drama_id?, episode_offset?)`、`verify_drama(drama_id)`。
 
-**任务**：`list_tasks(drama_id?)`、`get_task(task_id)`、`retry_task(task_id)`。任务来源是 Huobao `/tasks` 接口，当前只公开图片/视频任务；不伪造文本任务或百分比，`progress_percent` 为 `null` 并说明后端未提供。后端没有可重放的源任务参数或 retry 路由，因此 `retry_task` 会明确返回 `RETRY_UNSUPPORTED`，不会谎称重试成功。
+**任务**：`list_tasks(drama_id?)`、`get_task(task_id)`、`retry_task(task_id)`。任务来源是 Huobao `/tasks` 接口，当前只公开图片/视频任务；不伪造文本任务或百分比，`progress_percent` 为 `null` 并说明后端未提供。后端没有 retry 路由，但任务记录保存原始生成参数；连接器按记录调用现有 `POST /tasks` 创建一个新任务，并在连接器状态卷记录每个旧任务最多一次。旧任务记录不变；请求失败也计为一次重试尝试。
 
 ## 导入格式与分批
 
