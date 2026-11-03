@@ -19,11 +19,15 @@ services:
       HUOBAO_API_BASE: ${HUOBAO_API_BASE:-http://app:5679/api/v1}
       MUSE_BRIDGE_TOKEN: ${MUSE_BRIDGE_TOKEN:-}
       ALLOWED_DRAMA_IDS: ${ALLOWED_DRAMA_IDS:-}
+      MUSE_STATE_PATH: /data/state.json
     ports:
-      - "${MUSE_CONNECTOR_BIND:-127.0.0.1}:5680:5680"
+      - "${MUSE_CONNECTOR_BIND:-0.0.0.0}:5680:5680"
+    volumes:
+      - muse-state:/data
     depends_on:
       - app
     restart: unless-stopped
 
 volumes:
   huobao-data:
+  muse-state:
