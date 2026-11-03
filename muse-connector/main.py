@@ -63,9 +63,13 @@ async def board(bid):
             for b in bs or []:
                 if int(b.get('id',0))==bid:return d,e,b
     raise HuobaoError('分镜不存在或无权访问',404,'NOT_FOUND')
-def count_rel(d):
+async def count_rel(d):
     eps=d.get('episodes') or []
-    return {'episodes':len(eps),'storyboards':sum(len(e.get('storyboards') or []) for e in eps),'assets':sum(len(d.get(k) or []) for k in ('characters','scenes','props'))}
+    boards=0
+    for e in eps:
+        rows=await request('GET',f"/episodes/{e['id']}/storyboards")
+        boards += len(rows or [])
+    return {'episodes':len(eps),'storyboards':boards,'assets':sum(len(d.get(k) or []) for k in ('characters','scenes','props'))}
 def parse(s):
     try: x=json.loads(s)
     except Exception as e: raise HuobaoError('fields_json 必须是合法 JSON') from e
@@ -84,7 +88,7 @@ async def create_drama(title:str,description:str=''):
 @mcp.tool()
 async def delete_drama(drama_id:int):
     try:
-        d=await drama(drama_id); counts=count_rel(d); await request('DELETE',f'/dramas/{drama_id}')
+        d=await drama(drama_id); counts=await count_rel(d); await request('DELETE',f'/dramas/{drama_id}')
         s=state(); s['registered_drama_ids']=[x for x in s.get('registered_drama_ids',[]) if x!=drama_id]; save_state(s)
         return {'ok':True,'deleted_id':drama_id,'type':'drama','related_before_delete':counts}
     except HuobaoError as e:return {'deleted_id':drama_id,'type':'drama',**e.data()}
@@ -235,7 +239,7 @@ async def import_drama_bundle(bundle_json:str,drama_id:int|None=None,episode_off
         try:
             if row: report['reused_entities'].append({'kind':kind,'name':name,'id':row['id']})
             else:
-                result=await entity_create(kind,drama_id,{'name':name}); eid=int(result['id']); row={'id':eid,'name':name}; existing[kind][name]=row; report['created_entities'].append({'kind':kind,'name':name,'id':eid})
+                result=await entity_create(kind,drama_id,({'location':name} if kind=='scene' else {'name':name})); eid=int(result['id']); row={'id':eid,'name':name}; existing[kind][name]=row; report['created_entities'].append({'kind':kind,'name':name,'id':eid})
             await upload_drama_asset(drama_id,kind,int(row['id']),str(asset.get('filename','asset.jpg')),str(asset.get('base64_data','')))
             report['uploaded_assets'].append({'kind':kind,'name':name,'id':row['id']})
         except HuobaoError as e:report['failures'].append({'kind':'asset','name':name,'reason':e.reason})
@@ -286,10 +290,17 @@ async def list_tasks(drama_id:int|None=None):
     return [task_norm(t) for t in rows or [] if not ALLOW or int(t.get('dramaId',t.get('drama_id')) or 0) in ALLOW or int(t.get('dramaId',t.get('drama_id')) or 0) in state().get('registered_drama_ids',[])]
 @mcp.tool()
 async def get_task(task_id:int):
-    t=await request('GET',f'/tasks/{task_id}'); return task_norm(t) if t else None
+    t=await request('GET',f'/tasks/{task_id}')
+    if t and ALLOW:
+        did=int(t.get('dramaId',t.get('drama_id')) or 0)
+        if did not in ALLOW and did not in state().get('registered_drama_ids',[]): raise HuobaoError('任务所属剧不在允许范围内',403,'DRAMA_NOT_ALLOWED')
+    return task_norm(t) if t else None
 @mcp.tool()
 async def retry_task(task_id:int):
     t=await request('GET',f'/tasks/{task_id}')
+    if t and ALLOW:
+        did=int(t.get('dramaId',t.get('drama_id')) or 0)
+        if did not in ALLOW and did not in state().get('registered_drama_ids',[]): raise HuobaoError('任务所属剧不在允许范围内',403,'DRAMA_NOT_ALLOWED')
     if not t or t.get('status')!='failed':raise HuobaoError('仅失败任务可重试',400,'NOT_RETRYABLE')
     st=state(); retries=st.setdefault('retries',{})
     if retries.get(str(task_id),0)>=1:raise HuobaoError('该任务已重试过一次',409,'RETRY_LIMIT')
