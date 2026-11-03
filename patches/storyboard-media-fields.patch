@@ -1,7 +1,7 @@
 diff --git a/backend/src/routes/storyboards.ts b/backend/src/routes/storyboards.ts
 --- a/backend/src/routes/storyboards.ts
 +++ b/backend/src/routes/storyboards.ts
-@@ -134,7 +134,8 @@ app.put('/:id', async (c) => {
+@@ -134,5 +134,6 @@ app.put('/:id', async (c) => {
      image_prompt: 'imagePrompt', scene_id: 'sceneId', location: 'location',
      time: 'time', atmosphere: 'atmosphere', result: 'result',
      bgm_prompt: 'bgmPrompt', sound_effect: 'soundEffect',
@@ -9,3 +9,9 @@ diff --git a/backend/src/routes/storyboards.ts b/backend/src/routes/storyboards.
 +    video_url: 'videoUrl', composed_image: 'composedImage',
 +    first_frame_image: 'firstFrameImage', last_frame_image: 'lastFrameImage',
    }
+diff --git a/backend/src/routes/upload.ts b/backend/src/routes/upload.ts
+--- a/backend/src/routes/upload.ts
++++ b/backend/src/routes/upload.ts
+@@ -27,1 +27,1 @@
+-const VIDEO_MAX = 50 * 1024 * 1024 // 50MB
++const VIDEO_MAX = 100 * 1024 * 1024 // 100MB
