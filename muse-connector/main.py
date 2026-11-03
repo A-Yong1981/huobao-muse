@@ -39,13 +39,25 @@ async def request(method,path,*,json_body=None,files=None):
 
 def check(did):
     if ALLOW and did not in ALLOW and did not in state().get('registered_drama_ids',[]): raise HuobaoError('剧集不在 ALLOWED_DRAMA_IDS 允许范围内',403,'DRAMA_NOT_ALLOWED')
+async def all_dramas():
+    collected=[]
+    page=1
+    while True:
+        result=await request('GET',f'/dramas?page={page}&page_size=100')
+        rows=result.get('items',[]) if isinstance(result,dict) else result
+        collected.extend(rows or [])
+        pagination=result.get('pagination',{}) if isinstance(result,dict) else {}
+        if not rows or page >= int(pagination.get('total_pages',page)):
+            break
+        page+=1
+    return collected
+
 async def drama(did):
     check(did); d=await request('GET',f'/dramas/{did}')
     if not isinstance(d,dict) or int(d.get('id',0))!=did: raise HuobaoError('剧集不存在',404,'NOT_FOUND')
     return d
 async def episode(eid):
-    dramas=await request('GET','/dramas')
-    rows=dramas.get('items',[]) if isinstance(dramas,dict) else dramas
+    rows=await all_dramas()
     for x in rows or []:
         did=int(x.get('id',0))
         try: d=await drama(did)
@@ -54,7 +66,7 @@ async def episode(eid):
             if int(e.get('id',0))==eid:return d,e
     raise HuobaoError('集不存在或无权访问',404,'NOT_FOUND')
 async def board(bid):
-    rows=await request('GET','/dramas'); rows=rows.get('items',[]) if isinstance(rows,dict) else rows
+    rows=await all_dramas()
     for x in rows or []:
         try:d=await drama(int(x.get('id',0)))
         except HuobaoError:continue
@@ -78,7 +90,7 @@ def parse(s):
 
 @mcp.tool()
 async def list_dramas():
-    rows=await request('GET','/dramas'); rows=rows.get('items',[]) if isinstance(rows,dict) else rows
+    rows=await all_dramas()
     return [x for x in (rows or []) if not ALLOW or int(x.get('id',0)) in ALLOW or int(x.get('id',0)) in state().get('registered_drama_ids',[])]
 @mcp.tool()
 async def create_drama(title:str,description:str=''):
