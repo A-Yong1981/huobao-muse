@@ -1,0 +1,12 @@
+services:
+  muse-connector:
+    profiles: ["muse"]
+    build:
+      context: ./muse-connector
+    env_file:
+      - .env
+    ports:
+      - "${MUSE_CONNECTOR_BIND:-127.0.0.1}:5680:5680"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

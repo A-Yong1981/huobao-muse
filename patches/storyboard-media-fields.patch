@@ -1,0 +1,11 @@
+diff --git a/backend/src/routes/storyboards.ts b/backend/src/routes/storyboards.ts
+--- a/backend/src/routes/storyboards.ts
++++ b/backend/src/routes/storyboards.ts
+@@ -134,7 +134,8 @@ app.put('/:id', async (c) => {
+     image_prompt: 'imagePrompt', scene_id: 'sceneId', location: 'location',
+     time: 'time', atmosphere: 'atmosphere', result: 'result',
+     bgm_prompt: 'bgmPrompt', sound_effect: 'soundEffect',
+-    video_url: 'videoUrl',
++    video_url: 'videoUrl', composed_image: 'composedImage',
++    first_frame_image: 'firstFrameImage', last_frame_image: 'lastFrameImage',
+   }
