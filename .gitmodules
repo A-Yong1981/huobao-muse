@@ -1,0 +1,3 @@
+[submodule "huobao-drama"]
+	path = huobao-drama
+	url = https://github.com/chatfire-AI/huobao-drama.git

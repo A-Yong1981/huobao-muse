@@ -1,12 +1,30 @@
 services:
+  app:
+    image: huobao/huobao-muse:${HUOBAO_VERSION:-muse-build}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HUOBAO_VERSION: ${HUOBAO_VERSION:-muse-build}
+    ports:
+      - "5679:5679"
+    volumes:
+      - huobao-data:/app/data
+    restart: unless-stopped
+
   muse-connector:
     profiles: ["muse"]
     build:
       context: ./muse-connector
-    env_file:
-      - .env
+    environment:
+      HUOBAO_API_BASE: ${HUOBAO_API_BASE:-http://app:5679/api/v1}
+      MUSE_BRIDGE_TOKEN: ${MUSE_BRIDGE_TOKEN:-}
+      ALLOWED_DRAMA_IDS: ${ALLOWED_DRAMA_IDS:-}
     ports:
       - "${MUSE_CONNECTOR_BIND:-127.0.0.1}:5680:5680"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    depends_on:
+      - app
     restart: unless-stopped
+
+volumes:
+  huobao-data:

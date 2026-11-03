@@ -1,35 +1,51 @@
-# Huobao Muse
+# Huobao Muse — 完整短剧制作系统
 
-Huobao Drama 的 Muse MCP 连接器。Muse 负责生成剧本、分镜提示词和媒体；Huobao Drama 继续保存项目、脚本、分镜及生成素材。连接器通过火宝现有 API 读写数据，不接触 AI 服务商密钥。
+本仓库把 **Huobao Drama 完整应用** 与 Muse MCP 连接器整合为一套部署工程。Huobao Drama 上游代码作为固定版本的 Git 子模块保留；本仓库提供统一的构建、Docker Compose 部署和 Muse 接入配置。
 
-## 项目内容
+## 仓库结构
 
-- `muse-connector/`：带 Bearer token 鉴权和剧集白名单的 MCP 服务。
-- `docker-compose.yml`：独立部署连接器。
-- `docs/MUSE_CONNECTOR.md`：部署步骤、Muse 接入方式和工作流。
-- `patches/storyboard-media-fields.patch`：火宝现有分镜 API 的素材字段补丁。
+- `huobao-drama/`：完整 Huobao Drama 上游源代码子模块，固定在 v4.0.10 对应提交。
+- `muse-connector/`：Muse MCP 服务，负责安全读取项目、写入脚本/分镜和上传生成素材。
+- `Dockerfile`：从子模块构建火宝前端与后端，并应用 Muse 分镜媒体字段补丁。
+- `docker-compose.yml`：统一编排 Huobao Drama 与可选 Muse 连接器。
 
-## 快速部署
+## 获取完整源码
 
-1. 先按 `patches/storyboard-media-fields.patch` 给 Huobao Drama 后端应用小补丁并重新构建/启动；这样 Muse 上传的分镜图和首尾帧才能写回分镜记录。角色、场景、道具图以及分镜视频使用火宝已有接口。
-2. 复制 `.env.example` 为 `.env`，设置随机的 `MUSE_BRIDGE_TOKEN`、火宝 API 地址和明确的 `ALLOWED_DRAMA_IDS`。
-3. 启动：
+必须递归克隆，以同时检出 Huobao Drama 子模块：
+
+```sh
+git clone --recurse-submodules https://github.com/A-Yong1981/huobao-muse.git
+cd huobao-muse
+```
+
+若已普通克隆：
+
+```sh
+git submodule update --init --recursive
+```
+
+## 部署
+
+1. 复制 `.env.example` 为 `.env`，设置 `MUSE_BRIDGE_TOKEN` 为随机长令牌。
+2. 启动完整火宝短剧系统：
 
    ```sh
-   docker compose --profile muse up -d --build
+   docker compose up -d --build app
    ```
 
-4. 将 `https://你的域名/huobao-muse/mcp` 配置到 Muse，并使用 `Authorization: Bearer <MUSE_BRIDGE_TOKEN>`。异地 Muse 连接请经 HTTPS 反向代理或现有认证中转访问；不要把连接器端口直接暴露到公网。
+3. 打开 `http://NAS地址:5679`，创建短剧并记下其 ID；把允许 Muse 访问的剧集 ID 写入 `.env` 的 `ALLOWED_DRAMA_IDS`，多个 ID 用逗号分隔。
+4. 启动 Muse 连接器：
 
-完整配置见 [Muse MCP connector 使用说明](docs/MUSE_CONNECTOR.md)。
+   ```sh
+   docker compose --profile muse up -d --build muse-connector
+   ```
 
-## 安全默认值
+5. Muse MCP 地址为 `https://你的域名/huobao-muse/mcp`。经 HTTPS 反向代理或现有认证中转对外提供服务；连接器端口默认只绑定 `127.0.0.1`，不要直接暴露到公网。
 
-- `ALLOWED_DRAMA_IDS` 为空时不允许读取任何剧集。
-- Compose 默认只绑定 `127.0.0.1:5680`。
-- 连接器仅提供明确列出的读取、脚本/分镜更新和素材上传工具，不提供任意 API 代理、删除操作或模型服务商密钥。
-- 不要提交真实 `.env`、令牌、项目数据库或生成媒体。
+配置和工作流详见 [Muse MCP connector 文档](docs/MUSE_CONNECTOR.md)。数据保存在 Docker 卷 `huobao-data`。
 
-## 当前范围
+## 更新上游版本
 
-这是 Muse 与火宝之间的内容/素材交接层，不会把 Muse 桌面端伪装成模型 API，也不会把 Muse 执行状态写入火宝 `sys_task` 任务面板。火宝原有 API 模型生成通道可继续使用。分阶段审核由 Muse 工作流提示词要求每阶段暂停，当前连接器不强制实施审批门禁。
+本仓库固定使用已验证的上游子模块提交。更新火宝版本时，先更新 `huobao-drama` 子模块指针，再检查本仓库的 Dockerfile 补丁是否仍适用，最后重新构建镜像并提交新的子模块指针。
+
+Huobao Drama 上游使用 CC BY-NC-SA 4.0 许可；详见 `huobao-drama/LICENSE`。本仓库未复制上游源码，子模块保留原始来源和许可信息。
