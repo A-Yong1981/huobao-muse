@@ -321,15 +321,26 @@ async def retry_task(task_id:int):
     except (TypeError,ValueError): params={}
     body={'type':t.get('type'),'drama_id':t.get('dramaId'),'storyboard_id':t.get('storyboardId'),
           'scene_id':t.get('sceneId'),'character_id':t.get('characterId'),'prop_id':t.get('propId'),
-          'prompt':t.get('prompt'),'model':t.get('model'),'config_id':t.get('configId'),**params}
-    if body['type']=='video': body['force_new']=True
+          'prompt':t.get('prompt'),'model':t.get('model'),'config_id':t.get('configId')}
+    if body['type']=='image':
+        body.update(params)
+    elif body['type']=='video':
+        mapping={'referenceMode':'reference_mode','imageUrl':'image_url','firstFrameUrl':'first_frame_url',
+                 'lastFrameUrl':'last_frame_url','referenceImageUrls':'reference_image_urls',
+                 'referenceVideoUrls':'reference_video_urls','referenceAudioUrls':'reference_audio_urls',
+                 'referenceFileUrl':'file_url','referenceLinkUrl':'link_url','generateAudio':'generate_audio',
+                 'aspectRatio':'aspect_ratio','promptExtend':'prompt_extend'}
+        body.update({mapping.get(k,k):v for k,v in params.items()})
+        body['force_new']=True
+    st.setdefault('retries',{})[str(task_id)]=1
+    save_state(st)
     try:
         new=await request('POST','/tasks',json_body=body)
     except HuobaoError as e:
         return {'old_task_id':task_id,'type':t.get('type'),**e.data()}
     new_id=new.get('id') if isinstance(new,dict) else None
     if new_id is None: raise HuobaoError('后端重试响应未返回新任务 ID',502,'INVALID_TASK_RESPONSE')
-    retries[str(task_id)]=1; retries[str(new_id)]=0; save_state(st)
+    retries[str(new_id)]=0; save_state(st)
     return {'old_task_id':task_id,'old_task_status':'failed','new_task_id':new_id,'type':t.get('type'),'retry_count':1,'old_task_unchanged':True}
 
 def authorized(inner):
