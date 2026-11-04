@@ -12,11 +12,15 @@
 
 **剧集**：`list_dramas`、`get_drama`、`create_drama(title, description?)`、`delete_drama(drama_id)`。
 
+**接手规则**：读取项目后调用 `get_project_guidelines(drama_id, agent_type="all", language="zh")` 获取当前项目启用的风格预设完整提示词，以及各平台 Agent 的有效 System Prompt 和技能。项目使用自定义风格文本时，`style.source` 为 `custom`，`style.prompt` 返回该文本；停用的预设不注入。可指定具体 `agent_type` 缩小返回内容。每次接手或配置更改后重新读取；明确的用户指令优先。内部 Agent 规则中提及的工具名须按 MCP 实际工具列表映射。规则对外部智能体以工具结果提供，模型是否遵守仍需检查生成结果。
+
 **集**：`get_episode`、`create_episode(drama_id,title,order?)`、`update_episode(episode_id,fields_json)`、`update_episode_script`、`delete_episode`、`list_storyboards`。
 
 **分镜**：`create_storyboard(episode_id,fields_json)`、`update_storyboard`、`delete_storyboard`、`upload_storyboard_media`、`delete_storyboard_media`。更新白名单涵盖标题、描述、镜头类型、角度、运镜、时长、视频/图片提示词、场景、地点、时间、氛围、结果、音乐提示词、音效及媒体字段。新建分镜只接受上游创建路由真实支持的字段。
 
 **实体**：`create_character` / `update_character` / `delete_character`，以及 scene、prop 同类工具；`upload_drama_asset` 和 `delete_drama_asset` 管理已存在实体的图片记录。
+
+**读取素材字节**：将 `character_sheet`、`scene_sheet`、`prop_sheet`、分镜图等字段中的 `static/...` 路径前加 `/`，向同一个 MCP 域名发送 `GET /static/...`，并携带与 `/mcp` 相同的 `Authorization: Bearer <令牌>`。响应是原始图片或视频字节，保留媒体类型；支持 `HEAD` 和 `Range`。缺失文件返回 404，错误令牌返回 401。路径不放入令牌，也不要把令牌加入 URL。此路径供 Muse 下载角色定妆照作为图像模型的真实参考输入。
 
 **导入与校验**：`import_drama_bundle(bundle_json, drama_id?, episode_offset?)`、`verify_drama(drama_id)`。
 

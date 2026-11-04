@@ -1,0 +1,452 @@
+diff --git a/frontend/app/layouts/default.vue b/frontend/app/layouts/default.vue
+index 2b125e4..3261043 100644
+--- a/frontend/app/layouts/default.vue
++++ b/frontend/app/layouts/default.vue
+@@ -75,6 +75,8 @@ const missingConfigLabels = ref([])
+ 
+ async function checkAiConfigs() {
+   try {
++    const mode = await fetch('/api/v1/settings/generation-mode', { cache: 'no-store' }).then(r => r.json())
++    if (mode?.data?.mode === 'mcp') { missingConfigLabels.value = []; return }
+     const configs = await aiConfigAPI.list()
+     const labels = SERVICE_TYPE_LABELS.value
+     missingConfigLabels.value = Object.entries(labels)
+@@ -83,7 +85,8 @@ async function checkAiConfigs() {
+   } catch { /* 配置检查失败不阻塞页面 */ }
+ }
+ 
+-onMounted(checkAiConfigs)
++onMounted(() => { checkAiConfigs(); window.addEventListener('generation-mode-changed', checkAiConfigs) })
++onUnmounted(() => window.removeEventListener('generation-mode-changed', checkAiConfigs))
+ // 设置页保存配置后返回时重新检查(布局跨页面复用,onMounted 只触发一次)
+ watch(() => route.path, checkAiConfigs)
+ // 切换界面语言时横幅中已拼接的类型文案需要重算
+diff --git a/frontend/app/pages/index.vue b/frontend/app/pages/index.vue
+index 40a0cd0..3d2f1c8 100644
+--- a/frontend/app/pages/index.vue
++++ b/frontend/app/pages/index.vue
+@@ -74,7 +74,8 @@
+         @keydown.space.prevent="openDrama(d)"
+       >
+         <div class="project-cover">
+-          <span class="cover-initial">{{ coverInitial(d) }}</span>
++          <img v-if="d.thumbnail" :src="d.thumbnail.startsWith('http') || d.thumbnail.startsWith('/') ? d.thumbnail : '/' + d.thumbnail" :alt="d.title + ' 海报'" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover" />
++          <span v-else class="cover-initial">{{ coverInitial(d) }}</span>
+           <span v-if="d.aspect_ratio && d.aspect_ratio !== 'adaptive'" class="cover-ratio">{{ d.aspect_ratio }}</span>
+           <div class="status-wrap" @click.stop>
+             <AppMenu
+@@ -112,6 +113,8 @@
+                 </button>
+               </template>
+               <AppMenuItem @click="activeMenuId = null; openDrama(d)">{{ t('index.openProject') }}</AppMenuItem>
++              <AppMenuItem @click="activeMenuId = null; choosePoster(d)">上传项目海报</AppMenuItem>
++              <AppMenuItem @click="activeMenuId = null; configurePoster(d)">海报生成提示词</AppMenuItem>
+               <AppMenuItem danger @click="activeMenuId = null; dramaToDelete = d">{{ t('index.deleteProject') }}</AppMenuItem>
+             </AppMenu>
+           </div>
+@@ -202,13 +205,21 @@ import { toast } from 'vue-sonner'
+ import { toastError } from '~/composables/useToast'
+ import { useI18n } from 'vue-i18n'
+ import { Clock, CircleHelp } from 'lucide-vue-next'
+-import { dramaAPI, stylePresetAPI } from '~/composables/useApi'
++import { dramaAPI, stylePresetAPI, uploadAPI } from '~/composables/useApi'
+ import BaseSelect from '~/components/BaseSelect.vue'
+ import { startTour, autoTour } from '~/composables/useTour'
+ 
+ const { t, locale } = useI18n()
+ 
+ const dramas = ref([])
++function choosePoster(d) {
++  const input = document.createElement('input'); input.type = 'file'; input.accept = 'image/png,image/jpeg,image/webp'
++  input.onchange = async () => { const file = input.files?.[0]; if (!file) return; try { const uploaded = await uploadAPI.image(file); await dramaAPI.update(d.id, { thumbnail: uploaded.path }); d.thumbnail = uploaded.path; toast.success('海报已保存') } catch (e) { toastError(e) } }
++  input.click()
++}
++async function configurePoster(d) {
++  try { const response = await fetch(`/api/v1/dramas/${d.id}/poster-config`); const data = await response.json(); if (!response.ok) throw new Error('读取失败'); const prompt = window.prompt('填写海报生成提示词，智能体可读取并生成后上传', data.data?.prompt || ''); if (prompt === null) return; const saved = await fetch(`/api/v1/dramas/${d.id}/poster-config`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ prompt }) }); if (!saved.ok) throw new Error('保存失败'); toast.success('海报提示词已保存') } catch (e) { toastError(e) }
++}
+ const loading = ref(false)
+ const showCreate = ref(false)
+ const searchKeyword = ref('')
+diff --git a/frontend/app/pages/settings.vue b/frontend/app/pages/settings.vue
+index cb0be43..509c022 100644
+--- a/frontend/app/pages/settings.vue
++++ b/frontend/app/pages/settings.vue
+@@ -19,6 +19,14 @@
+             <h2 class="settings-title">{{ t('settings.general.title') }}</h2>
+             <p class="settings-desc">{{ t('settings.general.desc') }}</p>
+           </div>
++          <section class="card svc-group">
++            <div class="svc-group-head"><div class="svc-group-heading"><span class="svc-group-title">生成方式</span><div class="svc-group-sub">选择智能体接入或平台 API 调用。</div></div></div>
++            <div class="config-row"><div class="lang-picker"><button type="button" :class="['lang-option', { on: generationMode === 'mcp' }]" @click="setGenerationMode('mcp')">MCP 智能体</button><button type="button" :class="['lang-option', { on: generationMode === 'api' }]" @click="setGenerationMode('api')">API 调用</button></div></div>
++          </section>
++          <section class="card svc-group">
++            <div class="svc-group-head"><div class="svc-group-heading"><span class="svc-group-title">智能体活动监控</span><div class="svc-group-sub">最近 100 条连接器请求；不记录令牌或请求内容。</div></div><button class="btn btn-sm" @click="loadAgentActivity">刷新</button></div>
++            <div class="dialog-body config-dialog-body"><p v-if="!agentActivity.length">暂无记录</p><div v-for="(entry, i) in agentActivity" :key="i" class="config-row">{{ entry.time }} · {{ entry.tool || entry.rpc_method || entry.method }} · {{ entry.status }} · {{ entry.duration_ms }} ms</div></div>
++          </section>
+           <section class="card svc-group">
+             <div class="svc-group-head">
+               <div class="svc-group-heading">
+@@ -70,6 +78,38 @@
+               </div>
+             </div>
+           </section>
++
++          <section class="card svc-group">
++            <div class="svc-group-head">
++              <div class="svc-group-heading">
++                <span class="svc-group-title">OTP 验证设备</span>
++                <div class="svc-group-sub">换绑后旧设备的登录凭证会失效。</div>
++              </div>
++              <span :class="['tag', otpStatus?.bound ? 'tag-success' : 'tag-error']">{{ otpStatus?.bound ? '已绑定' : '未绑定' }}</span>
++            </div>
++            <div v-if="otpStatus?.bound && otpStatus?.authenticated" class="dialog-body config-dialog-body">
++              <label class="field"><span class="field-label">当前验证器的 6 位动态码</span>
++                <input v-model="otpCurrentCode" class="input mono" inputmode="numeric" maxlength="6" autocomplete="one-time-code" />
++              </label>
++              <button v-if="!otpQrSvg" type="button" class="btn btn-sm" :disabled="otpSaving" @click="startOtpRebind">生成新设备绑定二维码</button>
++              <template v-else>
++                <div class="otp-qr" v-html="otpQrSvg"></div>
++                <div class="field-hint">用新设备扫码，或手动输入密钥：<code>{{ otpManualSecret }}</code></div>
++                <label class="field"><span class="field-label">新验证器的 6 位动态码</span>
++                  <input v-model="otpNewCode" class="input mono" inputmode="numeric" maxlength="6" autocomplete="one-time-code" />
++                </label>
++                <div class="model-add-row">
++                  <button type="button" class="btn btn-primary btn-sm" :disabled="otpSaving" @click="confirmOtpRebind">确认换绑</button>
++                  <button type="button" class="btn btn-sm" @click="cancelOtpRebind">取消</button>
++                </div>
++              </template>
++              <div v-if="otpError" class="field-hint otp-error">{{ otpError }}</div>
++            </div>
++            <div v-else class="dialog-body config-dialog-body">
++              <div class="field-hint">{{ otpStatus?.bound ? '请先完成 OTP 登录。' : '请先完成首次扫码绑定。' }}</div>
++              <a class="btn btn-sm" href="/auth">前往 OTP 验证页面</a>
++            </div>
++          </section>
+         </div>
+ 
+         <!-- ===== AI 服务配置 ===== -->
+@@ -188,6 +228,38 @@
+               <p v-if="!byType(st.type).length" class="config-empty">{{ t('settings.common.empty') }}</p>
+             </section>
+           </div>
++          <section class="card svc-group">
++            <div class="svc-group-head">
++              <div class="svc-group-heading">
++                <span class="svc-group-title">Muse MCP 接入</span>
++                <div class="svc-group-sub">连接器令牌保存在 NAS 数据卷中，重启和重建后保持不变。</div>
++              </div>
++              <span :class="['tag', museStatus?.token_configured ? 'tag-success' : 'tag-error']">
++                {{ museStatus?.token_configured ? '已配置' : '未配置或不可达' }}
++              </span>
++            </div>
++            <div class="dialog-body config-dialog-body">
++              <label class="field"><span class="field-label">MCP API 地址</span>
++                <input class="input mono" :value="museStatus?.mcp_url || 'https://hb-mcp.aynas.de5.net/mcp'" readonly />
++              </label>
++              <label class="field"><span class="field-label">当前生效令牌</span>
++                <input v-model="museCurrentToken" class="input mono" :type="showMuseCurrentToken ? 'text' : 'password'" autocomplete="off" spellcheck="false" placeholder="首次配置时请输入初始令牌" />
++              </label>
++              <div class="model-add-row">
++                <button type="button" class="btn btn-sm" @click="showMuseCurrentToken = !showMuseCurrentToken">{{ showMuseCurrentToken ? '隐藏当前令牌' : '显示当前令牌' }}</button>
++                <button type="button" class="btn btn-sm" :disabled="!museCurrentToken" @click="copyMuseToken">复制当前令牌</button>
++              </div>
++              <label class="field"><span class="field-label">新令牌</span>
++                <input v-model="museNewToken" class="input mono" :type="showMuseToken ? 'text' : 'password'" autocomplete="off" spellcheck="false" placeholder="至少 24 位，可自定义或随机生成" />
++              </label>
++              <div class="model-add-row">
++                <button type="button" class="btn btn-sm" @click="generateMuseToken">随机生成</button>
++                <button type="button" class="btn btn-sm" @click="showMuseToken = !showMuseToken">{{ showMuseToken ? '隐藏令牌' : '显示令牌' }}</button>
++                <button type="button" class="btn btn-primary btn-sm" :disabled="museSaving" @click="saveMuseToken">保存令牌</button>
++              </div>
++              <span class="field-hint">只有点击“保存令牌”才会更换令牌；保存后 Muse BOT 需要同步新值。刷新页面可再次查看当前生效值。</span>
++            </div>
++          </section>
+         </div>
+ 
+         <!-- ===== 风格预设 ===== -->
+@@ -272,6 +344,19 @@
+             <p class="config-empty">{{ t('settings.storage.note') }}</p>
+             <p v-if="!isDesktopMode" class="config-empty">{{ t('settings.storage.serverNote') }}</p>
+           </section>
++          <section v-if="storageInfo?.mode === 'server'" class="card svc-group">
++            <div class="svc-group-head">
++              <div class="svc-group-heading">
++                <span class="svc-group-title">手动导出剧本与素材</span>
++                <div class="svc-group-sub">下载全部项目的分集剧本、分镜、人物、场景、道具记录与本机素材。</div>
++              </div>
++            </div>
++            <div class="dialog-body config-dialog-body">
++              <select v-model="exportProject" class="input"><option value="">全部项目</option><option v-for="p in exportProjects" :key="p.id" :value="String(p.id)">{{ p.title }}</option></select>
++              <a class="btn btn-primary btn-sm" :href="'/api/v1/storage/export' + (exportProject ? '?project_id=' + encodeURIComponent(exportProject) : '')">下载归档（tar.gz）</a>
++              <span class="field-hint">归档不包含模型 API Key、Muse 令牌和完整数据库；外部素材网址只保留引用。</span>
++            </div>
++          </section>
+         </div>
+ 
+         <!-- ===== 关于更新 ===== -->
+@@ -497,10 +582,10 @@
+           <div class="preset-picker">
+             <button
+               v-for="preset in presetsByType(cfgForm.service_type)"
+-              :key="`${cfgForm.service_type}-${preset.provider}`"
++              :key="`${cfgForm.service_type}-${preset.key}`"
+               type="button"
+               class="preset-pill"
+-              @click="applyProviderPreset(cfgForm.service_type, preset.provider)"
++              @click="applyProviderPreset(cfgForm.service_type, preset.key)"
+             >
+               {{ preset.label }}
+             </button>
+@@ -511,6 +596,7 @@
+           </label>
+           <label class="field"><span class="field-label">{{ t('settings.cfg.provider') }}</span>
+             <BaseSelect v-model="cfgForm.provider" :options="providerSelectOptions" :placeholder="t('settings.cfg.providerPlaceholder')" searchable />
++            <span v-if="cfgForm.provider === 'deepseek'" class="field-hint">DeepSeek 使用 OpenAI 兼容协议</span>
+           </label>
+           <label class="field">
+             <span class="field-label">{{ t('settings.cfg.priority') }}</span>
+@@ -689,7 +775,7 @@ import BaseSelect from '~/components/BaseSelect.vue'
+ import { toast } from 'vue-sonner'
+ import { toastError } from '~/composables/useToast'
+ import { useI18n } from 'vue-i18n'
+-import { aiConfigAPI, promptAPI, skillsAPI, storageAPI, stylePresetAPI, settingsAPI, serverUpdateAPI } from '~/composables/useApi'
++import { aiConfigAPI, promptAPI, skillsAPI, storageAPI, stylePresetAPI, settingsAPI, serverUpdateAPI, dramaAPI } from '~/composables/useApi'
+ import { useDesktopBridge } from '~/composables/useDesktopBridge'
+ import { useMigrateState } from '~/composables/useMigrateState'
+ import { useTheme } from '~/composables/useTheme'
+@@ -722,6 +808,112 @@ const huobaoSaving = ref(false)
+ const huobaoRegion = ref(locale.value?.startsWith('zh') ? 'cn' : 'com')
+ const huobaoSiteUrl = computed(() => `https://api.firemux.${huobaoRegion.value}`)
+ const cfgForm = reactive({ name: '', provider: '', api_key: '', base_url: '', models: [], service_type: 'text', priority: 0, temperature: '' })
++const museStatus = ref(null)
++const generationMode = ref('api')
++const exportProject = ref('')
++const exportProjects = ref([])
++onMounted(async () => { try { const r = await dramaAPI.list(); exportProjects.value = r.items || [] } catch {} })
++const agentActivity = ref([])
++async function loadAgentActivity() { try { const r = await fetch('/api/v1/settings/agent-activity', { cache: 'no-store' }); const j = await r.json(); agentActivity.value = j.data?.entries || [] } catch { toast.error('读取活动记录失败') } }
++async function loadGenerationMode() { try { const r = await fetch('/api/v1/settings/generation-mode'); const j = await r.json(); generationMode.value = j.data?.mode || 'api' } catch {} }
++async function setGenerationMode(mode) { try { const r = await fetch('/api/v1/settings/generation-mode', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode }) }); if (!r.ok) throw new Error(); generationMode.value = mode; window.dispatchEvent(new Event('generation-mode-changed')); toast.success('生成方式已保存'); } catch { toast.error('保存失败') } }
++onMounted(() => { loadGenerationMode(); loadAgentActivity() })
++const museCurrentToken = ref('')
++const museNewToken = ref('')
++const showMuseCurrentToken = ref(false)
++const showMuseToken = ref(false)
++const museSaving = ref(false)
++const otpStatus = ref(null)
++const otpCurrentCode = ref('')
++const otpNewCode = ref('')
++const otpQrSvg = ref('')
++const otpManualSecret = ref('')
++const otpSaving = ref(false)
++const otpError = ref('')
++async function loadOtpStatus() {
++  try {
++    const response = await fetch('/auth/status', { cache: 'no-store' })
++    otpStatus.value = response.ok ? await response.json() : null
++  } catch { otpStatus.value = null }
++}
++function cancelOtpRebind() {
++  otpQrSvg.value = ''
++  otpManualSecret.value = ''
++  otpNewCode.value = ''
++  otpError.value = ''
++}
++async function otpRequest(path, body) {
++  const response = await fetch(path, {
++    method: 'POST',
++    headers: { 'content-type': 'application/json' },
++    credentials: 'same-origin',
++    body: JSON.stringify(body),
++  })
++  const result = await response.json()
++  if (!response.ok) throw new Error(result.error || 'OTP 验证失败')
++  return result
++}
++async function startOtpRebind() {
++  otpError.value = ''
++  if (!/^\d{6}$/.test(otpCurrentCode.value.trim())) { otpError.value = '请输入当前验证器的 6 位动态码'; return }
++  otpSaving.value = true
++  try {
++    const result = await otpRequest('/auth/enroll/start', { current_code: otpCurrentCode.value.trim() })
++    otpQrSvg.value = result.qr_svg
++    otpManualSecret.value = result.manual_secret
++  } catch (error) { otpError.value = error.message || '生成二维码失败' }
++  finally { otpSaving.value = false }
++}
++async function confirmOtpRebind() {
++  otpError.value = ''
++  if (!/^\d{6}$/.test(otpNewCode.value.trim())) { otpError.value = '请输入新验证器的 6 位动态码'; return }
++  otpSaving.value = true
++  try {
++    await otpRequest('/auth/enroll/confirm', { current_code: otpCurrentCode.value.trim(), new_code: otpNewCode.value.trim() })
++    cancelOtpRebind()
++    otpCurrentCode.value = ''
++    await loadOtpStatus()
++    toast.success('OTP 验证设备已换绑')
++  } catch (error) { otpError.value = error.message || '换绑失败' }
++  finally { otpSaving.value = false }
++}
++async function loadMuseStatus() {
++  try {
++    const response = await fetch('/api/v1/settings/muse-connector', { cache: 'no-store' })
++    museStatus.value = response.ok ? await response.json() : null
++    if (museStatus.value?.current_token) museCurrentToken.value = museStatus.value.current_token
++  } catch { museStatus.value = null }
++}
++async function copyMuseToken() {
++  try {
++    await navigator.clipboard.writeText(museCurrentToken.value)
++    toast.success('当前 Muse 令牌已复制')
++  } catch { toast.error('复制失败，请显示令牌后手动复制') }
++}
++function generateMuseToken() {
++  const bytes = new Uint8Array(32)
++  crypto.getRandomValues(bytes)
++  museNewToken.value = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
++  showMuseToken.value = true
++}
++async function saveMuseToken() {
++  if (!museCurrentToken.value) { toast.warning('请输入当前 Muse 令牌'); return }
++  if (!/^[A-Za-z0-9._~+/-]{24,256}$/.test(museNewToken.value)) { toast.warning('新令牌须为 24–256 位 Bearer 字符'); return }
++  museSaving.value = true
++  try {
++    const response = await fetch('/api/v1/settings/muse-connector/token', {
++      method: 'PUT',
++      headers: { authorization: `Bearer ${museCurrentToken.value}`, 'content-type': 'application/json' },
++      body: JSON.stringify({ new_token: museNewToken.value }),
++    })
++    if (!response.ok) throw new Error(response.status === 401 ? '当前令牌不正确' : '令牌保存失败')
++    museCurrentToken.value = museNewToken.value
++    museNewToken.value = ''
++    museStatus.value = { ...museStatus.value, token_configured: true }
++    toast.success('Muse 令牌已保存并生效')
++  } catch (error) { toast.error(error.message || '令牌保存失败') }
++  finally { museSaving.value = false }
++}
+ // 模型标签编辑器：首位即默认模型；输入框支持回车添加、逗号/换行批量粘贴
+ const modelInput = ref('')
+ function addModel() {
+@@ -750,7 +942,10 @@ const serviceTypes = computed(() => [
+   { type: 'video', label: t('common.serviceType.video') },
+ ])
+ const providers = ['gemini', 'openai', 'volcengine', 'minimax', 'aliyun']
+-const providerSelectOptions = computed(() => providers.map(p => ({ label: p, value: p })))
++const providerSelectOptions = computed(() => [
++  ...(cfgForm.service_type === 'text' ? [{ label: 'deepseek（OpenAI 兼容）', value: 'deepseek' }] : []),
++  ...providers.map(p => ({ label: p, value: p })),
++])
+ const serviceMeta = computed(() => ({
+   text: { label: t('common.serviceType.text'), desc: t('settings.ai.meta.text') },
+   image: { label: t('common.serviceType.image'), desc: t('settings.ai.meta.image') },
+@@ -789,12 +984,12 @@ function countActive(t) { return byType(t).filter(c => c.is_active).length }
+ function fmtModel(m) { return Array.isArray(m) ? m.join(', ') : m || '—' }
+ function presetsByType(type) {
+   const group = providerPresets[type] || {}
+-  return Object.entries(group).map(([provider, preset]) => ({ provider, ...preset }))
++  return Object.entries(group).map(([key, preset]) => ({ key, provider: preset.provider || key, ...preset }))
+ }
+-function applyProviderPreset(type, provider) {
+-  const preset = providerPresets[type]?.[provider]
++function applyProviderPreset(type, key) {
++  const preset = providerPresets[type]?.[key]
+   if (!preset) return
+-  cfgForm.provider = provider
++  cfgForm.provider = preset.provider || key
+   cfgForm.base_url = preset.baseUrl
+   cfgForm.models = [...preset.models]
+   // 配置名持久化进 DB：用 provider 英文 + 服务类型英文标识拼，不随界面语言漂移
+@@ -862,7 +1057,7 @@ function startAddCfg(t) {
+   cfgTestResult.value = null
+   Object.assign(cfgForm, { name: '', provider: '', api_key: '', base_url: '', models: [], service_type: t, priority: 0, temperature: '' })
+   const firstPreset = presetsByType(t)[0]
+-  if (firstPreset) applyProviderPreset(t, firstPreset.provider)
++  if (firstPreset) applyProviderPreset(t, firstPreset.key)
+   cfgDialog.value = true
+ }
+ function startEditCfg(c) {
+@@ -1223,7 +1418,7 @@ async function saveStyle() {
+   } catch (e) { toastError(e) }
+ }
+ 
+-onMounted(() => { loadCfgs(); loadAgents(); loadAllSkills(); loadAgentPrompt(selectedAgent.value); loadStylePresets() })
++onMounted(() => { loadCfgs(); loadMuseStatus(); loadAgents(); loadAllSkills(); loadAgentPrompt(selectedAgent.value); loadStylePresets() })
+ 
+ // ===== 应用内引导（设置页）：快捷配置 + 手动模板两步 =====
+ const SETTINGS_TOUR = [
+@@ -1271,6 +1466,7 @@ async function loadStorage() {
+ watch(tab, (active) => {
+   if (active === 'storage') loadStorage()
+   else stopUsagePoll()
++  if (active === 'general') { cancelOtpRebind(); loadOtpStatus() }
+ })
+ 
+ async function pickTarget() {
+@@ -1395,6 +1591,9 @@ onBeforeUnmount(stopUsagePoll)
+ </script>
+ 
+ <style scoped>
++.otp-qr { width: 220px; height: 220px; padding: 10px; margin: 8px 0; background: #fff; border-radius: 10px; }
++.otp-qr :deep(svg) { width: 100%; height: 100%; }
++.otp-error { color: var(--danger, #c43b35); }
+ .settings-page { display: flex; flex-direction: column; height: 100%; background: var(--bg-base); }
+ 
+ .settings-layout { display: flex; flex: 1; min-height: 0; }
+diff --git a/frontend/app/views/drama/episode.vue b/frontend/app/views/drama/episode.vue
+index 5334fca..5bff93d 100644
+--- a/frontend/app/views/drama/episode.vue
++++ b/frontend/app/views/drama/episode.vue
+@@ -174,7 +174,7 @@
+             </div>
+             <div class="toolbar-right">
+               <span v-if="rawLen" class="char-count">{{ t('episode.script.charCount', { n: rawLen }) }}</span>
+-              <button class="btn btn-sm" @click="saveRaw(); toast.success(t('episode.script.saved'))">
++              <button class="btn btn-sm" @click="saveRaw().then(ok => { if (ok) toast.success(t('episode.script.saved')) })">
+                 <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+                 {{ t('common.save') }}
+               </button>
+@@ -2727,19 +2727,27 @@ async function refresh() {
+   await Promise.all([loadGenTasks(), loadExportMerges()])
+ }
+ 
+-function saveRaw() { episodeAPI.update(epId.value, { content: localRaw.value }); episode.value.content = localRaw.value }
+-function saveScr() { episodeAPI.update(epId.value, { script_content: localScript.value }); episode.value.script_content = localScript.value }
++async function saveEpisodeText(field, value) {
++  const snapshot = { content: episode.value?.content ?? null, script_content: episode.value?.script_content ?? episode.value?.scriptContent ?? null }
++  try {
++    await episodeAPI.update(epId.value, { [field]: value, expected_snapshot: snapshot })
++    episode.value[field] = value
++    return true
++  } catch (e) { toastError(e); return false }
++}
++function saveRaw() { return saveEpisodeText('content', localRaw.value) }
++function saveScr() { return saveEpisodeText('script_content', localScript.value) }
+ // 发给 Agent 的 message 是功能性提示词而非 UI 文案：产出语言由后端全局「内容语言」指令控制，
+ // 这里保持中文不随界面语言变化
+-function doRewrite() { saveRaw(); runAgent('script_rewriter', '请读取剧本并改写为格式化剧本，然后保存', dramaId, epId.value, refresh, chatModelOverride(), chatConfigId()) }
+-function skipRewrite() {
++async function doRewrite() { if (await saveRaw()) runAgent('script_rewriter', '请读取剧本并改写为格式化剧本，然后保存', dramaId, epId.value, refresh, chatModelOverride(), chatConfigId()) }
++async function skipRewrite() {
+   const raw = (localRaw.value || rawContent.value || '').trim()
+   if (!raw) {
+     toast.warning(t('episode.script.rawRequired'))
+     return
+   }
+   localScript.value = raw
+-  saveScr()
++  if (!await saveScr()) return
+   toast.success(t('episode.script.skipDone'))
+   panel.value = 'production'
+   prodTab.value = 'assets'
+@@ -2755,9 +2763,9 @@ const extractingTargets = ref([])
+ const extractingLabels = computed(() => EXTRACT_TARGETS.value.filter(x => extractingTargets.value.includes(x.key)).map(x => x.label).join(t('common.listJoin')))
+ function isExtracting(target) { return extractingTargets.value.includes(target) }
+ 
+-function doExtract(target) {
++async function doExtract(target) {
+   if (isExtracting(target) || !epId.value) return
+-  saveScr()
++  if (!await saveScr()) return
+   extractingTargets.value.push(target)
+   episodeAPI.extract(epId.value, target, chatModelOverride(), chatConfigId())
+     .then(() => pollExtractStatus(target))

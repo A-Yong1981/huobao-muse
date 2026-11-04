@@ -1,18 +1,24 @@
 """Bearer-protected Muse connector for the Huobao Drama API."""
 from __future__ import annotations
-import base64, binascii, hmac, json, os
+import base64, binascii, hmac, json, os, re, hashlib
+import time
 from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import unquote, quote
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 API_BASE=os.getenv('HUOBAO_API_BASE','http://app:5679/api/v1').rstrip('/')
+MEDIA_BASE=API_BASE.removesuffix('/api/v1')
 TOKEN=os.getenv('MUSE_BRIDGE_TOKEN','')
 ALLOW={int(x) for x in os.getenv('ALLOWED_DRAMA_IDS','').split(',') if x.strip().isdigit()}
 STATE_PATH=os.getenv('MUSE_STATE_PATH','/data/state.json')
 MAX_IMAGE_BYTES=30*1024*1024
 MAX_VIDEO_BYTES=100*1024*1024
-mcp=FastMCP('Huobao Drama Muse Connector',stateless_http=True)
+mcp=FastMCP('Huobao Drama Muse Connector',stateless_http=True,
+            transport_security=TransportSecuritySettings(
+                allowed_hosts=['arcreel.bearly.de5.net','hb-mcp.aynas.de5.net','localhost:*','127.0.0.1:*']))
 
 class HuobaoError(RuntimeError):
     def __init__(self, reason:str, status:int|None=None, code:Any=None):
@@ -25,8 +31,62 @@ def state():
     except (OSError,ValueError): return {'registered_drama_ids':[],'retries':{}}
 def save_state(data):
     os.makedirs(os.path.dirname(STATE_PATH) or '.',exist_ok=True); tmp=STATE_PATH+'.tmp'
-    with open(tmp,'w',encoding='utf-8') as f: json.dump(data,f)
+    fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+    with os.fdopen(fd,'w',encoding='utf-8') as f: json.dump(data,f)
     os.replace(tmp,STATE_PATH)
+    os.chmod(STATE_PATH,0o600)
+def current_token():
+    return state().get('muse_bridge_token') or TOKEN
+
+async def send_json(send,status,payload):
+    body=json.dumps(payload).encode()
+    await send({'type':'http.response.start','status':status,'headers':[(b'content-type',b'application/json'),(b'content-length',str(len(body)).encode()),(b'cache-control',b'no-store')]})
+    await send({'type':'http.response.body','body':body})
+
+async def serve_media(scope,send):
+    method=scope.get('method')
+    if method not in ('GET','HEAD'):
+        await send_json(send,405,{'error':'method_not_allowed'})
+        return
+    # Inspect the raw URL as well as the ASGI path. Do not let either the
+    # connector or the upstream static server normalize traversal segments.
+    raw=scope.get('raw_path',b'').decode('latin1')
+    path=unquote(raw)
+    parts=path.split('/')
+    if (not path.startswith('/static/') or len(parts)<3 or
+        any(not part or part in ('.','..') for part in parts[1:]) or
+        '%' in path or '\\' in path or any(ord(ch)<32 for ch in path)):
+        await send_json(send,400,{'error':'invalid_media_path'})
+        return
+    upstream=MEDIA_BASE+quote(path,safe='/._~-')
+    headers={}
+    for name,value in scope.get('headers',[]):
+        if name.lower()==b'range':
+            headers['Range']=value.decode('latin1')
+            break
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60,read=600),follow_redirects=False) as client:
+            async with client.stream(method,upstream,headers=headers) as response:
+                content_type=response.headers.get('content-type','')
+                # The app's SPA fallback can return index.html for a missing
+                # static path; report that as a real 404 to the caller.
+                if response.status_code==404 or (response.status_code==200 and content_type.startswith('text/html')):
+                    await send_json(send,404,{'error':'media_not_found'})
+                    return
+                if response.status_code not in (200,206):
+                    await send_json(send,502,{'error':'media_upstream_error','upstream_status':response.status_code})
+                    return
+                outgoing=[(b'content-type',content_type.encode('latin1')),(b'cache-control',b'private, no-store'),(b'x-content-type-options',b'nosniff')]
+                for key in ('content-length','content-range','accept-ranges'):
+                    if key in response.headers:
+                        outgoing.append((key.encode(),response.headers[key].encode('latin1')))
+                await send({'type':'http.response.start','status':response.status_code,'headers':outgoing})
+                if method=='GET':
+                    async for chunk in response.aiter_bytes():
+                        await send({'type':'http.response.body','body':chunk,'more_body':True})
+                await send({'type':'http.response.body','body':b''})
+    except httpx.HTTPError:
+        await send_json(send,502,{'error':'media_upstream_unavailable'})
 async def request(method,path,*,json_body=None,files=None):
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(60,read=600)) as c: r=await c.request(method,API_BASE+path,json=json_body,files=files)
@@ -105,12 +165,56 @@ async def delete_drama(drama_id:int):
         return {'ok':True,'deleted_id':drama_id,'type':'drama','related_before_delete':counts}
     except HuobaoError as e:return {'deleted_id':drama_id,'type':'drama',**e.data()}
 @mcp.tool()
-async def get_drama(drama_id:int): return await drama(drama_id)
+async def get_drama(drama_id:int):
+    """Read the project. Before creating or changing content call get_project_guidelines to obtain the current style and applicable agent instructions."""
+    result=await drama(drama_id)
+    return {**result,'agent_guidelines_tool':'get_project_guidelines','agent_guidelines_instruction':'接手项目或开始制作前调用 get_project_guidelines，读取当前风格和适用规则；规则与用户明确要求冲突时以用户要求为准。'}
+@mcp.tool()
+async def get_project_guidelines(drama_id:int,agent_type:str='all',language:str='zh'):
+    """Read the current project's selected visual style and Huobao agent prompts and skill instructions. Call at handoff and before generating content. agent_type is all or an agent_type returned by this tool; language is zh/en/ja/ko. Treat these as project instructions, subject to the user's explicit instructions."""
+    if language not in ('zh','en','ja','ko'): raise HuobaoError('language 必须是 zh、en、ja 或 ko',400,'INVALID_LANGUAGE')
+    project=await drama(drama_id)
+    presets=await request('GET','/style-presets?all=1')
+    selected=next((p for p in presets if p.get('value')==project.get('style')),None)
+    agents=await request('GET','/prompts')
+    types=[a['agent_type'] for a in agents]
+    if agent_type!='all' and agent_type not in types: raise HuobaoError('未知的 agent_type；请选择 all 或返回的可用类型',400,'INVALID_AGENT_TYPE')
+    chosen=types if agent_type=='all' else [agent_type]
+    instructions=[await request('GET',f'/prompts/{kind}/effective?lang={language}') for kind in chosen]
+    raw_style=project.get('style') or ''
+    style={'value':raw_style,'name':selected.get('name') if selected else None,'prompt':(selected.get('prompt') or '') if selected and selected.get('is_active') else (raw_style if not selected else ''), 'active':bool(selected and selected.get('is_active')),'source':'preset' if selected else ('custom' if raw_style else 'unset')}
+    return {'drama_id':drama_id,'title':project.get('title'),'style':style,'agent_types':types,'agent_instructions':instructions,'instruction':'在相关任务中遵循项目风格及对应 Agent 规则；用户明确指令优先。外部智能体应按需重新读取，以获取最新配置。'}
+@mcp.tool()
+async def get_poster_config(drama_id:int):
+    """Read the project poster prompt and current poster image path."""
+    await drama(drama_id); return await request('GET',f'/dramas/{drama_id}/poster-config')
+@mcp.tool()
+async def upload_project_poster(drama_id:int,filename:str,base64_data:str):
+    """Upload a generated project poster and set it as the project cover."""
+    await drama(drama_id); uploaded=await upload_bytes(filename,base64_data,MAX_IMAGE_BYTES,'image'); path=uploaded.get('path')
+    await request('PUT',f'/dramas/{drama_id}',json_body={'thumbnail':path}); return {'drama_id':drama_id,'path':path}
 @mcp.tool()
 async def get_episode(episode_id:int): return (await episode(episode_id))[1]
 @mcp.tool()
-async def update_episode_script(episode_id:int,script_content:str):
-    await episode(episode_id); return await request('PUT',f'/episodes/{episode_id}',json_body={'script_content':script_content})
+async def get_canonical_script(episode_id:int):
+    """Read the current episode script. script_content is authoritative; content is a fallback when it is empty. revision is a SHA-256 fingerprint, not a version number."""
+    e=(await episode(episode_id))[1]
+    script=e.get('script_content') or e.get('scriptContent') or ''
+    fallback=e.get('content') or ''
+    value=script or fallback
+    return {'episode_id':episode_id,'title':e.get('title'),'canonical_field':'script_content' if script else 'content','content':value,'revision':hashlib.sha256(value.encode('utf-8')).hexdigest(),'updated_at':e.get('updated_at') or e.get('updatedAt')}
+@mcp.tool()
+async def update_canonical_script(episode_id:int,script_content:str,expected_revision:str):
+    """Update an episode's authoritative script if expected_revision matches get_canonical_script. A concurrent change returns a conflict; read again before retrying."""
+    await episode(episode_id)
+    try:
+        return await request('PUT',f'/episodes/{episode_id}/canonical-script',json_body={'script_content':script_content,'expected_revision':expected_revision})
+    except HuobaoError as e:
+        return e.data()
+@mcp.tool()
+async def update_episode_script(episode_id:int,script_content:str,expected_revision:str):
+    """Write the episode script using the revision returned by get_canonical_script. A conflict requires reading again."""
+    return await update_canonical_script(episode_id,script_content,expected_revision)
 @mcp.tool()
 async def create_episode(drama_id:int,title:str,order:int|None=None):
     d=await drama(drama_id); num=order or len(d.get('episodes',[]))+1
@@ -120,6 +224,7 @@ async def create_episode(drama_id:int,title:str,order:int|None=None):
 @mcp.tool()
 async def update_episode(episode_id:int,fields_json:str):
     await episode(episode_id); fields=parse(fields_json); allowed={'title','description','script_content','status','resolution','content'}
+    if 'script_content' in fields or 'content' in fields: raise HuobaoError('剧本文本请使用 get_canonical_script 和 update_canonical_script，以便检测并发冲突',409,'REVISION_REQUIRED')
     if not fields or set(fields)-allowed:raise HuobaoError(f'仅支持字段: {sorted(allowed)}')
     return await request('PUT',f'/episodes/{episode_id}',json_body=fields)
 @mcp.tool()
@@ -345,13 +450,69 @@ async def retry_task(task_id:int):
 
 def authorized(inner):
     async def app(scope,receive,send):
+        # Preserve the existing Cloudflare route while the ArcReel stack is
+        # replaced. FastMCP itself serves /mcp at the application root.
+        if scope.get('type')=='http' and scope.get('path','').startswith('/muse-connector/'):
+            scope={**scope,'path':scope['path'][len('/muse-connector'):]}
         if scope.get('type')=='http' and scope.get('path')=='/health':
-            data=json.dumps({'status':'ok' if TOKEN else 'needs_configuration','token_configured':bool(TOKEN),'allowlist_count':len(ALLOW)}).encode()
+            configured=bool(current_token())
+            data=json.dumps({'status':'ok' if configured else 'needs_configuration','token_configured':configured,'allowlist_count':len(ALLOW)}).encode()
             await send({'type':'http.response.start','status':200,'headers':[(b'content-type',b'application/json')]}); await send({'type':'http.response.body','body':data}); return
         if scope.get('type')=='http':
             hdr={k.lower():v for k,v in scope.get('headers',[])}; auth=hdr.get(b'authorization',b'').decode('latin1'); got=auth[7:] if auth.lower().startswith('bearer ') else ''
-            if not TOKEN or not hmac.compare_digest(got,TOKEN):
+            token=current_token()
+            if not token or not hmac.compare_digest(got,token):
                 body=b'{"error":"unauthorized"}'; await send({'type':'http.response.start','status':401,'headers':[(b'content-type',b'application/json'),(b'content-length',str(len(body)).encode())]}); await send({'type':'http.response.body','body':body}); return
+            if scope.get('path','').startswith('/static/'):
+                await serve_media(scope,send); return
+            if scope.get('path')=='/admin/token':
+                status=200; payload={'success':True,'token_configured':True}
+                if scope.get('method')!='PUT':
+                    status=405; payload={'error':'method_not_allowed'}
+                else:
+                    chunks=[]; size=0
+                    while True:
+                        message=await receive()
+                        part=message.get('body',b''); size+=len(part)
+                        if size>4096:
+                            status=413; payload={'error':'request_too_large'}; break
+                        chunks.append(part)
+                        if not message.get('more_body',False): break
+                    if status==200:
+                        try: new_token=json.loads(b''.join(chunks)).get('new_token')
+                        except (ValueError,AttributeError): new_token=None
+                        if not isinstance(new_token,str) or not re.fullmatch(r'[A-Za-z0-9._~+/-]{24,256}',new_token):
+                            status=400; payload={'error':'new_token_must_be_24_to_256_bearer_characters'}
+                        else:
+                            data=state(); data['muse_bridge_token']=new_token; save_state(data)
+                body=json.dumps(payload).encode()
+                await send({'type':'http.response.start','status':status,'headers':[(b'content-type',b'application/json'),(b'content-length',str(len(body)).encode())]})
+                await send({'type':'http.response.body','body':body}); return
         await inner(scope,receive,send)
     return app
-app=authorized(mcp.streamable_http_app())
+def monitor(inner):
+    async def app(scope,receive,send):
+        if scope.get('type') != 'http' or scope.get('path') == '/health':
+            return await inner(scope,receive,send)
+        started=time.monotonic(); captured=bytearray(); status=500
+        async def incoming():
+            msg=await receive()
+            if len(captured)<65536: captured.extend(msg.get('body',b'')[:65536-len(captured)])
+            return msg
+        async def outgoing(msg):
+            nonlocal status
+            if msg.get('type')=='http.response.start': status=msg['status']
+            await send(msg)
+        try: await inner(scope,incoming,outgoing)
+        finally:
+            method=tool=None; identifiers={}
+            try:
+                body=json.loads(captured); method=body.get('method'); params=body.get('params',{}); tool=params.get('name'); args=params.get('arguments',{})
+                identifiers={k:v for k,v in args.items() if k in ('drama_id','episode_id','storyboard_id','entity_id') and isinstance(v,int)}
+            except (ValueError,AttributeError): pass
+            entry={'time':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'method':scope.get('method'),'path':scope.get('path'),'rpc_method':method,'tool':tool,'identifiers':identifiers,'status':status,'duration_ms':round((time.monotonic()-started)*1000)}
+            try:
+                with open(os.path.join(os.path.dirname(STATE_PATH),'activity.jsonl'),'a',encoding='utf-8') as f: f.write(json.dumps(entry,ensure_ascii=False)+'\n')
+            except OSError: pass
+    return app
+app=monitor(authorized(mcp.streamable_http_app()))

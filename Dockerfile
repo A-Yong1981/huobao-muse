@@ -1,29 +1,36 @@
 # Build the pinned Huobao Drama submodule together with this repository's
 # small API compatibility patch for Muse storyboard media uploads.
 
-FROM node:22-bookworm-slim AS frontend-build
+FROM docker.m.daocloud.io/library/node:22-bookworm-slim AS frontend-build
 WORKDIR /build/frontend
 COPY huobao-drama/frontend/package.json huobao-drama/frontend/package-lock.json ./
 RUN node -e "const fs=require('fs');const l=JSON.parse(fs.readFileSync('package-lock.json'));for(const p of Object.values(l.packages||{}))delete p.resolved;fs.writeFileSync('package-lock.json',JSON.stringify(l,null,2))" \
   && npm ci --no-audit --no-fund --registry=https://registry.npmjs.org
 COPY huobao-drama/frontend/ ./
+COPY patches/huobao-frontend-custom.patch /tmp/huobao-frontend-custom.patch
+RUN apt-get update && apt-get install -y --no-install-recommends patch && rm -rf /var/lib/apt/lists/* \
+  && (patch --batch --reverse --dry-run -p2 < /tmp/huobao-frontend-custom.patch >/dev/null 2>&1 || patch --batch --forward -p2 < /tmp/huobao-frontend-custom.patch)
 RUN npm run generate
 
-FROM node:22-bookworm AS backend-build
+FROM docker.m.daocloud.io/library/node:22-bookworm AS backend-build
 WORKDIR /build/backend
 COPY huobao-drama/backend/package.json huobao-drama/backend/package-lock.json ./
 RUN node -e "const fs=require('fs');const l=JSON.parse(fs.readFileSync('package-lock.json'));for(const p of Object.values(l.packages||{}))delete p.resolved;fs.writeFileSync('package-lock.json',JSON.stringify(l,null,2))" \
-  && npm ci --no-audit --no-fund --registry=https://registry.npmjs.org
+  && npm ci --omit=dev --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
+RUN NODE_ENV=production npm i tsx@^4.21.0 --no-save --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org \
+  && npm rebuild better-sqlite3 --build-from-source
+RUN npm install --prefix /tmp/tsx tsx@^4.21.0 --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org \
+  && cp -a /tmp/tsx/node_modules/. ./node_modules/ \
+  && ./node_modules/.bin/tsx --version \
+  && rm -rf /tmp/tsx
 COPY huobao-drama/backend/ ./
+COPY patches/huobao-backend-custom.patch /tmp/huobao-backend-custom.patch
+RUN (patch --batch --reverse --dry-run -p2 < /tmp/huobao-backend-custom.patch >/dev/null 2>&1 || patch --batch --forward -p2 < /tmp/huobao-backend-custom.patch)
 COPY patches/storyboard-media-fields.patch /tmp/storyboard-media-fields.patch
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends patch \
-  && patch --batch --forward -p1 -d /build < /tmp/storyboard-media-fields.patch \
-  && rm -rf /var/lib/apt/lists/* /tmp/storyboard-media-fields.patch
-RUN npm prune --omit=dev \
-  && npm i tsx@^4.21.0 --no-save --no-audit --no-fund --registry=https://registry.npmjs.org
+RUN patch --batch --forward -p1 -d /build < /tmp/storyboard-media-fields.patch \
+  && rm -f /tmp/storyboard-media-fields.patch
 
-FROM node:22-bookworm-slim
+FROM docker.m.daocloud.io/library/node:22-bookworm-slim
 ARG HUOBAO_VERSION=muse-build
 ENV NODE_ENV=production \
     HUOBAO_VERSION=${HUOBAO_VERSION} \

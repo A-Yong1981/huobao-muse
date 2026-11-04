@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>火宝 Muse · 安全验证</title>
+  <style>
+    :root{font-family:Inter,"Microsoft YaHei",system-ui,sans-serif;color-scheme:dark}
+    *{box-sizing:border-box}body{min-height:100vh;margin:0;background:radial-gradient(circle at 20% 10%,#244752 0,transparent 35%),#101820;color:#eef4f5;display:grid;place-items:center;padding:24px}
+    main{width:min(100%,460px);background:#1a2730;border:1px solid #36505a;border-radius:18px;padding:28px;box-shadow:0 22px 70px #0006}
+    h1{margin:0 0 6px;font-size:23px}p{color:#aec2c7;line-height:1.6;font-size:14px;margin:8px 0 20px}
+    label{display:block;margin:16px 0 6px;color:#cad9dc;font-size:13px}input{width:100%;padding:12px 14px;background:#102029;color:#fff;border:1px solid #44606a;border-radius:9px;font-size:16px}
+    input:focus{outline:2px solid #54bfaa}button{border:0;background:#57c7ae;color:#10211f;padding:12px 18px;border-radius:9px;font-size:14px;font-weight:700;cursor:pointer;margin:16px 8px 0 0}button.secondary{background:#304851;color:#e8f3f3}
+    button:disabled{opacity:.55;cursor:wait}.row{display:flex;align-items:center;gap:9px;margin-top:16px;color:#b9cccf;font-size:14px}.row input{width:auto}
+    #qr{background:white;border-radius:10px;width:220px;height:220px;display:grid;place-items:center;margin:20px auto 8px;padding:10px}#qr svg{max-width:100%;max-height:100%}
+    code{display:block;word-break:break-all;color:#a9e7d7;text-align:center}#message{min-height:20px;margin-top:18px;font-size:14px;color:#ffb5ad}
+    [hidden]{display:none!important}
+  </style>
+</head>
+<body>
+<main>
+  <h1>火宝 Muse</h1>
+  <p id="subtitle">正在检查验证状态…</p>
+  <section id="login" hidden>
+    <label for="login-code">验证器中的 6 位动态码</label><input id="login-code" inputmode="numeric" maxlength="6" autocomplete="one-time-code">
+    <label class="row"><input id="remember" type="checkbox" checked> 信任此设备 30 天</label>
+    <button id="login-button">验证并进入</button>
+  </section>
+  <section id="setup" hidden>
+    <label id="proof-label" for="proof">NAS 登录密码（仅首次绑定）</label><input id="proof" type="password" autocomplete="off">
+    <button id="start-button">生成绑定二维码</button>
+    <div id="enroll" hidden>
+      <div id="qr"></div>
+      <p>用身份验证器扫码；无法扫码时可手动输入下方密钥。</p>
+      <code id="manual-secret"></code>
+      <label for="new-code">新验证器中的 6 位动态码</label><input id="new-code" inputmode="numeric" maxlength="6" autocomplete="one-time-code">
+      <button id="confirm-button">确认绑定</button>
+    </div>
+  </section>
+  <section id="rebind" hidden>
+    <button onclick="location.href='/'">进入平台</button>
+    <button id="rebind-button" class="secondary">更换验证设备</button>
+    <button id="logout-button" class="secondary">退出登录</button>
+  </section>
+  <div id="message" role="status"></div>
+</main>
+<script>
+  const $ = id => document.getElementById(id)
+  let isBound = false
+  function message(text){ $('message').textContent = text }
+  async function call(path, data){
+    const response = await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data),credentials:'same-origin'})
+    const result = await response.json()
+    if(!response.ok) throw Error(result.error || '请求失败')
+    return result
+  }
+  async function init(){
+    try{
+      const response = await fetch('/auth/status',{cache:'no-store'})
+      const status = await response.json()
+      isBound = status.bound
+      if(status.authenticated){
+        $('subtitle').textContent='此设备已通过验证。'
+        $('rebind').hidden=false
+      }else if(status.bound){
+        $('subtitle').textContent='请输入验证器中的动态码。'
+        $('login').hidden=false
+      }else{
+        $('subtitle').textContent='首次使用：输入绑定密码并扫码。'
+        $('setup').hidden=false
+      }
+    }catch{message('验证服务暂时不可用，请稍后重试')}
+  }
+  $('login-button').onclick=async()=>{
+    try{await call('/auth/login',{code:$('login-code').value.trim(),remember:$('remember').checked});location.href='/'}
+    catch(error){message(error.message)}
+  }
+  $('rebind-button').onclick=()=>{
+    $('rebind').hidden=true;$('setup').hidden=false
+    $('proof-label').textContent='当前验证器中的 6 位动态码'
+    $('proof').type='text';$('proof').inputMode='numeric';$('proof').maxLength=6
+    $('subtitle').textContent='换绑前先验证当前设备。'
+  }
+  $('logout-button').onclick=async()=>{ await fetch('/auth/logout',{method:'POST'}); location.href='/auth' }
+  $('start-button').onclick=async()=>{
+    try{
+      const proof=$('proof').value.trim()
+      const result=await call('/auth/enroll/start',isBound?{current_code:proof}:{bootstrap_password:proof})
+      $('qr').innerHTML=result.qr_svg
+      $('manual-secret').textContent=result.manual_secret
+      $('enroll').hidden=false
+      message('')
+    }catch(error){message(error.message)}
+  }
+  $('confirm-button').onclick=async()=>{
+    try{
+      const proof=$('proof').value.trim()
+      await call('/auth/enroll/confirm',{...(isBound?{current_code:proof}:{bootstrap_password:proof}),new_code:$('new-code').value.trim()})
+      location.href='/'
+    }catch(error){message(error.message)}
+  }
+  init()
+</script>
+</body>
+</html>

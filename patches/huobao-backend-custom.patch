@@ -1,0 +1,546 @@
+diff --git a/backend/src/agents/index.ts b/backend/src/agents/index.ts
+index 27dbcfb..01836e4 100644
+--- a/backend/src/agents/index.ts
++++ b/backend/src/agents/index.ts
+@@ -193,7 +193,11 @@ function openaiThinkingOffPatch(): Record<string, any> {
+ 
+ function createThinkingOffFetch(providerName: string, baseURL: string): typeof fetch | undefined {
+   if (!thinkingOffEnabled || isOfficialTextHost(baseURL)) return undefined
+-  const openaiPatch = openaiThinkingOffPatch()
++  // DeepSeek's official endpoint accepts `thinking`, but not the extra
++  // compatibility flags used for generic relay services.
++  const openaiPatch = /^https:\/\/api\.deepseek\.com(?:\/|$)/.test(baseURL)
++    ? { thinking: { type: 'disabled' } }
++    : openaiThinkingOffPatch()
+ 
+   return async (input: any, init?: any) => {
+     try {
+diff --git a/backend/src/agents/tools/script-tools.ts b/backend/src/agents/tools/script-tools.ts
+index 2aa4d84..bb34c27 100644
+--- a/backend/src/agents/tools/script-tools.ts
++++ b/backend/src/agents/tools/script-tools.ts
+@@ -3,9 +3,10 @@
+  * 模块级单例 — episodeId 通过 RequestContext 按请求注入
+  */
+ import { createTool } from '@mastra/core/tools'
++import { createHash } from 'node:crypto'
+ import { z } from 'zod'
+ import { db, schema } from '../../db/index.js'
+-import { eq } from 'drizzle-orm'
++import { and, eq, isNull } from 'drizzle-orm'
+ import { now } from '../../utils/response.js'
+ import { getEpisodeId } from '../context.js'
+ 
+@@ -21,7 +22,7 @@ const readEpisodeScript = createTool({
+     if (!ep) return { error: `Episode not found (id=${episodeId})` }
+     const content = ep.content || ep.scriptContent
+     if (!content) return { error: `Episode has no content (id=${episodeId})` }
+-    return { content, word_count: content.length, episode_id: episodeId }
++    return { content, revision: createHash('sha256').update(ep.scriptContent || ep.content || '').digest('hex'), word_count: content.length, episode_id: episodeId }
+   },
+ })
+ 
+@@ -42,6 +43,7 @@ const rewriteToScreenplay = createTool({
+ 
+     return {
+       source_content: source,
++      revision: createHash('sha256').update(ep.scriptContent || ep.content || '').digest('hex'),
+       instruction: `请将以下内容改写为格式化剧本。
+ 
+ 格式规范：
+@@ -63,13 +65,19 @@ const saveScript = createTool({
+   description: 'Save the rewritten screenplay content to the current episode.',
+   inputSchema: z.object({
+     content: z.string().describe('The formatted screenplay content to save'),
++    expected_revision: z.string().describe('Revision returned by read_episode_script or rewrite_to_screenplay'),
+   }),
+-  execute: async ({ content }, context) => {
++  execute: async ({ content, expected_revision }, context) => {
+     const episodeId = getEpisodeId(context?.requestContext)
+     if (!episodeId) return { error: 'Missing episodeId in request context' }
+-    await db.update(schema.episodes)
++    const [ep] = await db.select().from(schema.episodes).where(eq(schema.episodes.id, episodeId))
++    if (!ep) return { error: 'Episode not found' }
++    if (createHash('sha256').update(ep.scriptContent || ep.content || '').digest('hex') !== expected_revision) return { error: 'revision_conflict', message: '剧本已被修改，请重新读取后再保存' }
++    const changed = await db.update(schema.episodes)
+       .set({ scriptContent: content, updatedAt: now() })
+-      .where(eq(schema.episodes.id, episodeId))
++      .where(and(eq(schema.episodes.id, episodeId), ep.scriptContent == null ? isNull(schema.episodes.scriptContent) : eq(schema.episodes.scriptContent, ep.scriptContent), ep.content == null ? isNull(schema.episodes.content) : eq(schema.episodes.content, ep.content)))
++      .returning({ id: schema.episodes.id })
++    if (!changed.length) return { error: 'revision_conflict', message: '剧本已被修改，请重新读取后再保存' }
+ 
+     return { message: `Script saved`, word_count: content.length }
+   },
+diff --git a/backend/src/middleware/logger.ts b/backend/src/middleware/logger.ts
+index 412b644..9b2e32e 100644
+--- a/backend/src/middleware/logger.ts
++++ b/backend/src/middleware/logger.ts
+@@ -1,4 +1,7 @@
+ import type { MiddlewareHandler } from 'hono'
++import { appendFile } from 'node:fs/promises'
++import path from 'node:path'
++import { DATA_ROOT } from '../utils/paths.js'
+ 
+ const colors = {
+   reset: '\x1b[0m',
+@@ -34,7 +37,8 @@ export const requestLogger: MiddlewareHandler = async (c, next) => {
+   let bodyInfo = ''
+   // 上传文件不克隆/读取请求体：避免记录音频内容，也让路由的大小限制先执行。
+   const isFileUpload = c.req.header('content-type')?.toLowerCase().startsWith('multipart/form-data')
+-  if (!isFileUpload && ['POST', 'PUT', 'PATCH'].includes(method)) {
++  const containsCredential = path === '/api/v1/settings/muse-connector/token'
++  if (!isFileUpload && !containsCredential && ['POST', 'PUT', 'PATCH'].includes(method)) {
+     try {
+       const clone = c.req.raw.clone()
+       const text = await clone.text()
+@@ -51,10 +55,15 @@ export const requestLogger: MiddlewareHandler = async (c, next) => {
+ 
+   const ms = (performance.now() - start).toFixed(0)
+   const status = c.res.status
++  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) && /^\/api\/v1\/(dramas|episodes|storyboards|characters|scenes|props|upload)(\/|$)/.test(path)) {
++    void appendFile(pathModule(), JSON.stringify({ time: new Date().toISOString(), source: 'platform', method, path, status, duration_ms: Number(ms) }) + '\n').catch(() => {})
++  }
+   const sc = statusColor(status)
+   console.log(`${colors.dim}${time}${colors.reset} ${colors.cyan}${method}${colors.reset} ${path} ${sc}${status}${colors.reset} ${colors.dim}${ms}ms${colors.reset}`)
+ }
+ 
++function pathModule() { return path.join(DATA_ROOT, 'project-activity.jsonl') }
++
+ /**
+  * 全局错误处理 — 捕获未处理异常，打印完整堆栈
+  */
+diff --git a/backend/src/routes/aiConfigs.ts b/backend/src/routes/aiConfigs.ts
+index a3b2ba3..bb610bf 100644
+--- a/backend/src/routes/aiConfigs.ts
++++ b/backend/src/routes/aiConfigs.ts
+@@ -61,6 +61,15 @@ function buildProbe(serviceType: string, provider: string, baseUrl: string, mode
+     }
+   }
+ 
++  if (p === 'deepseek') {
++    return {
++      method: 'GET',
++      url: joinProviderUrl(baseUrl, '', '/models'),
++      headers: bearerHeaders(apiKey),
++      body: undefined,
++    }
++  }
++
+   if (p === 'openai') {
+     return {
+       method: 'GET',
+diff --git a/backend/src/routes/dramas.ts b/backend/src/routes/dramas.ts
+index cf44236..e4b980b 100644
+--- a/backend/src/routes/dramas.ts
++++ b/backend/src/routes/dramas.ts
+@@ -86,6 +86,22 @@ app.get('/stats', async (c) => {
+ })
+ 
+ // GET /dramas/:id - Get drama detail
++app.get('/:id/poster-config', async (c) => {
++  const id = Number(c.req.param('id'))
++  const [project] = await db.select().from(schema.dramas).where(and(eq(schema.dramas.id, id), isNull(schema.dramas.deletedAt)))
++  if (!project) return notFound(c, '项目不存在')
++  const [setting] = await db.select().from(schema.appSettings).where(eq(schema.appSettings.key, `poster_prompt_${id}`))
++  return success(c, { prompt: setting?.value || '', thumbnail: project.thumbnail || '' })
++})
++app.put('/:id/poster-config', async (c) => {
++  const id = Number(c.req.param('id')); const body = await c.req.json().catch(() => null)
++  const [project] = await db.select().from(schema.dramas).where(and(eq(schema.dramas.id, id), isNull(schema.dramas.deletedAt)))
++  if (!project) return notFound(c, '项目不存在')
++  if (typeof body?.prompt !== 'string' || body.prompt.length > 10000) return badRequest(c, '海报提示词无效')
++  const key = `poster_prompt_${id}`; const updatedAt = now()
++  await db.insert(schema.appSettings).values({ key, value: body.prompt, updatedAt }).onConflictDoUpdate({ target: schema.appSettings.key, set: { value: body.prompt, updatedAt } })
++  return success(c, { prompt: body.prompt })
++})
+ app.get('/:id', async (c) => {
+   const id = Number(c.req.param('id'))
+   const [drama] = await db.select().from(schema.dramas).where(eq(schema.dramas.id, id))
+@@ -116,6 +132,7 @@ app.put('/:id', async (c) => {
+   const body = await c.req.json()
+   const updates: Record<string, any> = { updatedAt: now() }
+   if (body.title !== undefined) updates.title = body.title
++  if (body.thumbnail !== undefined) updates.thumbnail = body.thumbnail
+   if (body.description !== undefined) updates.description = body.description
+   if (body.genre !== undefined) updates.genre = body.genre
+   if (body.style !== undefined) updates.style = body.style
+@@ -156,6 +173,7 @@ app.put('/:id/episodes', async (c) => {
+   const dramaId = Number(c.req.param('id'))
+   const body = await c.req.json()
+   const episodes = body.episodes || []
++  if (episodes.some((ep: any) => ep.id && ('content' in ep || 'script_content' in ep || 'scriptContent' in ep))) return c.json({ error: 'revision_required', message: '更新剧本请使用带版本校验的分集接口' }, 409)
+   const ts = now()
+ 
+   for (const ep of episodes) {
+diff --git a/backend/src/routes/episodes.ts b/backend/src/routes/episodes.ts
+index 8b4cead..3a114a1 100644
+--- a/backend/src/routes/episodes.ts
++++ b/backend/src/routes/episodes.ts
+@@ -1,4 +1,5 @@
+ import { Hono } from 'hono'
++import { createHash } from 'node:crypto'
+ import { and, eq, isNull } from 'drizzle-orm'
+ import { db, getInsertId, schema } from '../db/index.js'
+ import { success, notFound, badRequest, now } from '../utils/response.js'
+@@ -9,6 +10,26 @@ import { getVideoPromptBatchStatus, startVideoPromptBatch } from '../services/vi
+ 
+ const app = new Hono()
+ 
++// Atomic optimistic write: the original values are part of the SQL predicate,
++// so concurrent web or MCP updates cannot silently overwrite this request.
++app.put('/:id/canonical-script', async (c) => {
++  const id = Number(c.req.param('id'))
++  const body = await c.req.json().catch(() => null)
++  if (typeof body?.script_content !== 'string' || !/^[a-f0-9]{64}$/.test(body?.expected_revision || '')) return badRequest(c, '需要 script_content 和 expected_revision')
++  const [ep] = await db.select().from(schema.episodes).where(and(eq(schema.episodes.id, id), isNull(schema.episodes.deletedAt)))
++  if (!ep) return notFound(c, '分集不存在')
++  const current = ep.scriptContent || ep.content || ''
++  const revision = createHash('sha256').update(current, 'utf8').digest('hex')
++  if (revision !== body.expected_revision) return c.json({ error: 'revision_conflict', current_revision: revision }, 409)
++  const condition = and(eq(schema.episodes.id, id), isNull(schema.episodes.deletedAt),
++    ep.scriptContent == null ? isNull(schema.episodes.scriptContent) : eq(schema.episodes.scriptContent, ep.scriptContent),
++    ep.content == null ? isNull(schema.episodes.content) : eq(schema.episodes.content, ep.content))
++  const updated = await db.update(schema.episodes).set({ scriptContent: body.script_content, updatedAt: now() }).where(condition).returning({ id: schema.episodes.id })
++  if (!updated.length) return c.json({ error: 'revision_conflict' }, 409)
++  const nextCanonical = body.script_content || ep.content || ''
++  return success(c, { episode_id: id, revision: createHash('sha256').update(nextCanonical, 'utf8').digest('hex') })
++})
++
+ // POST /episodes — Create a new episode
+ app.post('/', async (c) => {
+   const body = await c.req.json()
+@@ -57,6 +78,9 @@ app.put('/:id', async (c) => {
+   const body = await c.req.json()
+ 
+   const allowed = ['content', 'script_content', 'title', 'description', 'status', 'resolution']
++  if ('content' in body || 'script_content' in body) {
++    if (!body.expected_snapshot || typeof body.expected_snapshot !== 'object' || !('content' in body.expected_snapshot) || !('script_content' in body.expected_snapshot)) return c.json({ error: 'revision_required', message: '请重新读取剧本后再保存' }, 409)
++  }
+   const updates: Record<string, any> = {}
+   for (const key of allowed) {
+     if (key in body) updates[key] = body[key]
+@@ -75,7 +99,13 @@ app.put('/:id', async (c) => {
+   if ('status' in updates) drizzleUpdates.status = updates.status
+   if ('resolution' in updates) drizzleUpdates.resolution = updates.resolution
+ 
+-  await db.update(schema.episodes).set(drizzleUpdates).where(eq(schema.episodes.id, id))
++  let condition = eq(schema.episodes.id, id)
++  if ('content' in updates || 'script_content' in updates) {
++    const s = body.expected_snapshot
++    condition = and(eq(schema.episodes.id, id), isNull(schema.episodes.deletedAt), s.content == null ? isNull(schema.episodes.content) : eq(schema.episodes.content, s.content), s.script_content == null ? isNull(schema.episodes.scriptContent) : eq(schema.episodes.scriptContent, s.script_content))!
++  }
++  const changed = await db.update(schema.episodes).set(drizzleUpdates).where(condition).returning({ id: schema.episodes.id })
++  if (!changed.length) return c.json({ error: 'revision_conflict', message: '剧本已被修改，请重新读取后再保存' }, 409)
+   return success(c)
+ })
+ 
+diff --git a/backend/src/routes/prompts.ts b/backend/src/routes/prompts.ts
+index e28a377..c92c82a 100644
+--- a/backend/src/routes/prompts.ts
++++ b/backend/src/routes/prompts.ts
+@@ -8,6 +8,7 @@ import { success, badRequest } from '../utils/response.js'
+ import { skillsManagerWorkspace } from '../agents/skills.js'
+ import { validAgentTypes, DEFAULT_PROMPTS } from '../agents/index.js'
+ import { loadAgentPromptFile, serializePromptFile, promptFilePath } from '../agents/prompts.js'
++import { loadAgentSkills } from '../agents/skills.js'
+ 
+ const app = new Hono()
+ const fsm = () => skillsManagerWorkspace.filesystem!
+@@ -31,6 +32,14 @@ app.get('/', async (c) => {
+ })
+ 
+ // GET /prompts/:type?lang= — 有效内容（语言变体优先，缺失回退基础版，再缺失回退代码默认）
++app.get('/:type/effective', async (c) => {
++  const type = c.req.param('type')
++  if (!checkType(type)) return badRequest(c, '未知的 Agent 类型')
++  const lang = normalizeLang(c.req.query('lang'))
++  const file = await loadAgentPromptFile(type, lang)
++  const skills = await loadAgentSkills(type, lang)
++  return success(c, { agent_type: type, lang, system_prompt: file?.instructions || DEFAULT_PROMPTS[type].instructions, skills })
++})
+ // is_default=true 表示当前语言无独立文件（内容为回退版本），前端据此提示「跟随中文」
+ app.get('/:type', async (c) => {
+   const type = c.req.param('type')
+diff --git a/backend/src/routes/settings.ts b/backend/src/routes/settings.ts
+index 9f19757..3d70901 100644
+--- a/backend/src/routes/settings.ts
++++ b/backend/src/routes/settings.ts
+@@ -2,10 +2,84 @@
+  * 应用设置路由 — 全局配置的读写入口（当前：AI 内容语言）
+  */
+ import { Hono } from 'hono'
++import { readFile } from 'node:fs/promises'
++import path from 'node:path'
++import { DATA_ROOT } from '../utils/paths.js'
++import { eq } from 'drizzle-orm'
++import { db, schema } from '../db/index.js'
+ import { getContentLanguage, setContentLanguage, getToursSeen, setToursSeen, CONTENT_LANGUAGES, type ContentLanguage } from '../services/app-settings.js'
+ import { success, badRequest } from '../utils/response.js'
+ 
+ const app = new Hono()
++app.get('/generation-mode', (c) => {
++  const row = db.select().from(schema.appSettings).where(eq(schema.appSettings.key, 'generation_mode')).get()
++  return success(c, { mode: row?.value === 'mcp' ? 'mcp' : 'api' })
++})
++app.put('/generation-mode', async (c) => {
++  const body = await c.req.json().catch(() => null)
++  if (!['mcp', 'api'].includes(body?.mode)) return badRequest(c, 'mode 必须为 mcp 或 api')
++  db.insert(schema.appSettings).values({ key: 'generation_mode', value: body.mode, updatedAt: new Date().toISOString() }).onConflictDoUpdate({ target: schema.appSettings.key, set: { value: body.mode, updatedAt: new Date().toISOString() } }).run()
++  return success(c, { mode: body.mode })
++})
++const museConnectorBase = (process.env.MUSE_CONNECTOR_INTERNAL_URL || 'http://muse-connector:5680').replace(/\/$/, '')
++const museStatePath = process.env.MUSE_STATE_READ_PATH || '/app/muse-state/state.json'
++app.get('/agent-activity', async (c) => {
++  const files = ['/app/muse-state/activity.jsonl', path.join(DATA_ROOT, 'project-activity.jsonl')]
++  const entries = (await Promise.all(files.map(file => readFile(file, 'utf8').catch(() => '')))).flatMap(text => text.trim().split('\n').slice(-100).flatMap(line => { try { return [JSON.parse(line)] } catch { return [] } })).sort((a,b) => String(b.time).localeCompare(String(a.time))).slice(0,100)
++  c.header('Cache-Control', 'no-store')
++  return success(c, { entries })
++})
++
++async function savedMuseToken(): Promise<string> {
++  try {
++    const state = JSON.parse(await readFile(museStatePath, 'utf8')) as { muse_bridge_token?: unknown }
++    return typeof state.muse_bridge_token === 'string' ? state.muse_bridge_token : ''
++  } catch {
++    return ''
++  }
++}
++
++// The OTP gateway protects this settings API. Read the connector's persisted token
++// from its mounted volume so the page shows the value actually used after rebuilds.
++app.get('/muse-connector', async (c) => {
++  try {
++    const response = await fetch(`${museConnectorBase}/health`, { signal: AbortSignal.timeout(10000) })
++    if (!response.ok) return c.json({ error: 'connector_unavailable' }, 502)
++    const health = await response.json() as { status?: string; token_configured?: boolean }
++    const currentToken = await savedMuseToken()
++    c.header('Cache-Control', 'no-store')
++    return c.json({ status: health.status, token_configured: !!health.token_configured,
++      current_token: currentToken || null,
++      mcp_url: process.env.MUSE_MCP_PUBLIC_URL || 'https://hb-mcp.aynas.de5.net/mcp' })
++  } catch {
++    return c.json({ error: 'connector_unavailable' }, 502)
++  }
++})
++
++// Use the token in the persistent volume. A manually supplied current token is
++// retained for initial bootstrap when no state file exists yet.
++app.put('/muse-connector/token', async (c) => {
++  const currentToken = await savedMuseToken() || (c.req.header('authorization') || '').replace(/^Bearer /i, '')
++  if (!currentToken) return c.json({ error: 'current_token_required' }, 401)
++  const body = await c.req.json().catch(() => null)
++  const newToken = body?.new_token
++  if (typeof newToken !== 'string' || !/^[A-Za-z0-9._~+/-]{24,256}$/.test(newToken)) {
++    return c.json({ error: 'new_token_must_be_24_to_256_bearer_characters' }, 400)
++  }
++  try {
++    const response = await fetch(`${museConnectorBase}/admin/token`, {
++      method: 'PUT',
++      headers: { authorization: `Bearer ${currentToken}`, 'content-type': 'application/json' },
++      body: JSON.stringify({ new_token: newToken }),
++      signal: AbortSignal.timeout(10000),
++    })
++    if (!response.ok) return c.json({ error: response.status === 401 ? 'current_token_invalid' : 'connector_rejected' }, response.status === 401 ? 401 : 502)
++    c.header('Cache-Control', 'no-store')
++    return c.json({ success: true, token_configured: true })
++  } catch {
++    return c.json({ error: 'connector_unavailable' }, 502)
++  }
++})
+ 
+ // GET /content-language — 当前 AI 内容语言
+ app.get('/content-language', async (c) => {
+diff --git a/backend/src/routes/storage.ts b/backend/src/routes/storage.ts
+index 5158250..004299c 100644
+--- a/backend/src/routes/storage.ts
++++ b/backend/src/routes/storage.ts
+@@ -6,8 +6,12 @@
+  * 过期时立即返回旧值并后台单飞重算（computing 防并发）；首次无值才同步等待。
+  */
+ import { Hono } from 'hono'
++import { stream } from 'hono/streaming'
++import { spawn } from 'node:child_process'
++import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
++import path from 'node:path'
+ import { DATA_ROOT, STORAGE_ROOT } from '../utils/paths.js'
+-import { dbPath } from '../db/index.js'
++import { db, dbPath, schema } from '../db/index.js'
+ import { dirUsage, volumeFreeBytes } from '../utils/dirsize.js'
+ import { success } from '../utils/response.js'
+ 
+@@ -38,6 +42,109 @@ async function computeUsage() {
+ const warmup = setTimeout(() => { void computeUsage() }, 10_000)
+ warmup.unref?.()
+ 
++// 导出业务内容及本机素材，不包含 ai_service_configs、令牌或整库文件。
++app.get('/export', async (c) => {
++  let workingDir: string | undefined
++  try {
++    const projectId = c.req.query('project_id') ? Number(c.req.query('project_id')) : null
++    if (projectId !== null && (!Number.isSafeInteger(projectId) || projectId < 1)) return c.json({ error: 'invalid_project_id' }, 400)
++    workingDir = await mkdtemp(path.join(DATA_ROOT, '.huobao-export-'))
++    const scriptsDir = path.join(workingDir, 'scripts')
++    await mkdir(scriptsDir)
++    const snapshot = {
++      format: 'huobao-scripts-assets-v1',
++      exported_at: new Date().toISOString(),
++      dramas: await db.select().from(schema.dramas),
++      episodes: await db.select().from(schema.episodes),
++      storyboards: await db.select().from(schema.storyboards),
++      characters: await db.select().from(schema.characters),
++      scenes: await db.select().from(schema.scenes),
++      props: await db.select().from(schema.props),
++      assets: await db.select().from(schema.assets),
++      episode_characters: await db.select().from(schema.episodeCharacters),
++      episode_scenes: await db.select().from(schema.episodeScenes),
++      episode_props: await db.select().from(schema.episodeProps),
++      storyboard_characters: await db.select().from(schema.storyboardCharacters),
++      storyboard_props: await db.select().from(schema.storyboardProps),
++    }
++    if (projectId !== null) {
++      snapshot.dramas = snapshot.dramas.filter(x => x.id === projectId && !x.deletedAt)
++      if (!snapshot.dramas.length) { await rm(workingDir, { recursive: true, force: true }); return c.json({ error: 'project_not_found' }, 404) }
++      snapshot.episodes = snapshot.episodes.filter(x => x.dramaId === projectId)
++      const episodes = new Set(snapshot.episodes.map(x => x.id))
++      snapshot.storyboards = snapshot.storyboards.filter(x => episodes.has(x.episodeId))
++      const boards = new Set(snapshot.storyboards.map(x => x.id))
++      snapshot.characters = snapshot.characters.filter(x => x.dramaId === projectId)
++      snapshot.scenes = snapshot.scenes.filter(x => x.dramaId === projectId)
++      snapshot.props = snapshot.props.filter(x => x.dramaId === projectId)
++      snapshot.assets = snapshot.assets.filter(x => x.dramaId === projectId)
++      snapshot.episode_characters = snapshot.episode_characters.filter(x => episodes.has(x.episodeId))
++      snapshot.episode_scenes = snapshot.episode_scenes.filter(x => episodes.has(x.episodeId))
++      snapshot.episode_props = snapshot.episode_props.filter(x => episodes.has(x.episodeId))
++      snapshot.storyboard_characters = snapshot.storyboard_characters.filter(x => boards.has(x.storyboardId))
++      snapshot.storyboard_props = snapshot.storyboard_props.filter(x => boards.has(x.storyboardId))
++    }
++    await writeFile(path.join(workingDir, 'project-data.json'), JSON.stringify(snapshot, null, 2), 'utf8')
++    for (const episode of snapshot.episodes) {
++      await writeFile(path.join(scriptsDir, `episode_${episode.id}.txt`), episode.scriptContent || episode.content || '', 'utf8')
++    }
++    await writeFile(path.join(workingDir, 'README.txt'),
++      '火宝剧本与素材手动导出。project-data.json 包含剧集、分集、分镜、人物、场景、道具与关联记录；scripts/ 为分集文本。static/ 和 legacy-arcreel/project/ 为本机素材与旧项目源文件。外部 URL 只保留引用，不会下载远程文件。此归档不包含模型 API Key、Muse 令牌或完整数据库。\n', 'utf8')
++
++    const archivePaths = ['-C', workingDir, 'README.txt', 'project-data.json', 'scripts']
++    const roots = ['static', 'legacy-arcreel/project/source', 'legacy-arcreel/project/scripts',
++      'legacy-arcreel/project/characters', 'legacy-arcreel/project/scenes', 'legacy-arcreel/project/props',
++      'legacy-arcreel/project/storyboards', 'legacy-arcreel/project/videos', 'legacy-arcreel/project/versions',
++      'legacy-arcreel/project/renders', 'legacy-arcreel/project/thumbnails', 'legacy-arcreel/project/subtitles']
++    for (const relative of projectId === null ? roots : []) {
++      const full = path.join(DATA_ROOT, relative)
++      try { if ((await stat(full)).isDirectory()) archivePaths.push('-C', DATA_ROOT, relative) }
++      catch { /* 旧项目或素材目录不存在 */ }
++    }
++    if (projectId !== null) {
++      const files = new Set<string>()
++      const collect = (value: unknown) => {
++        if (Array.isArray(value)) return value.forEach(collect)
++        if (value && typeof value === 'object') return Object.values(value).forEach(collect)
++        if (typeof value === 'string') {
++          const rel = value.replace(/^\//, '')
++          if (rel.startsWith('static/') && !rel.split('/').some(part => part === '..') && !rel.includes('\\')) files.add(rel)
++        }
++      }
++      collect(snapshot)
++      for (const relative of files) {
++        try { if ((await stat(path.join(DATA_ROOT, relative))).isFile()) archivePaths.push('-C', DATA_ROOT, relative) } catch { /* missing media */ }
++      }
++    }
++    const filename = `huobao-scripts-assets-${new Date().toISOString().replace(/[:.]/g, '-')}.tar.gz`
++    c.header('Content-Type', 'application/gzip')
++    c.header('Content-Disposition', `attachment; filename="${filename}"`)
++    c.header('Cache-Control', 'no-store')
++    const tempDir = workingDir
++    return stream(c, async (writer) => {
++      const child = spawn('tar', ['-czf', '-', ...archivePaths], { stdio: ['ignore', 'pipe', 'ignore'] })
++      const finished = new Promise<number>((resolve) => {
++        child.once('error', () => resolve(1))
++        child.once('close', (code) => resolve(code ?? 1))
++      })
++      try {
++        for await (const chunk of child.stdout!) await writer.write(chunk)
++        const code = await finished
++        if (code !== 0) console.error('Storage export archive failed', code)
++      } catch (error) {
++        child.kill()
++        console.error('Storage export stream failed', error)
++      } finally {
++        await rm(tempDir, { recursive: true, force: true })
++      }
++    })
++  } catch (error) {
++    if (workingDir) await rm(workingDir, { recursive: true, force: true })
++    console.error('Storage export preparation failed', error)
++    return c.json({ error: 'export_failed' }, 500)
++  }
++})
++
+ app.get('/', async (c) => {
+   const fresh = cache.computedAt && (Date.now() - new Date(cache.computedAt).getTime()) < USAGE_TTL_MS
+   let usageStale = false
+diff --git a/backend/src/services/ai.ts b/backend/src/services/ai.ts
+index ccc1a47..184ef8b 100644
+--- a/backend/src/services/ai.ts
++++ b/backend/src/services/ai.ts
+@@ -30,7 +30,7 @@ export function parseConfigTemperature(settingsRaw: string | null | undefined):
+ }
+ 
+ export const officialProviders: Record<ServiceType, readonly string[]> = {
+-  text: ['openai', 'gemini', 'volcengine'],
++  text: ['openai', 'deepseek', 'gemini', 'volcengine'],
+   image: ['openai', 'gemini', 'volcengine'],
+   video: ['volcengine', 'minimax', 'aliyun'],
+ }
+@@ -43,6 +43,8 @@ export function isOfficialProvider(serviceType?: string | null, provider?: strin
+ export function getTextProviderBaseUrl(config: AIConfig) {
+   const provider = config.provider.toLowerCase()
+ 
++  if (provider === 'deepseek') return config.baseUrl.replace(/\/$/, '')
++
+   if (provider === 'openai') {
+     return joinProviderUrl(config.baseUrl, '/v1', '')
+   }
+diff --git a/backend/src/utils/dirsize.ts b/backend/src/utils/dirsize.ts
+index cdbc81a..abfd589 100644
+--- a/backend/src/utils/dirsize.ts
++++ b/backend/src/utils/dirsize.ts
+@@ -20,7 +20,8 @@ export interface UsageBuckets {
+   total: number
+ }
+ 
+-const DB_FILE_BASE = 'huobao.sqlite3'
++const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.avif', '.bmp', '.svg', '.heic', '.heif', '.tif', '.tiff'])
++const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v', '.webm', '.mkv', '.avi', '.flv', '.ts'])
+ 
+ /** 递归 walk，对每个普通文件回调（完整路径 + 大小）；目录不可读/文件竞态静默跳过 */
+ async function walkFiles(dir: string, onFile: (filePath: string, size: number) => void): Promise<void> {
+@@ -59,9 +60,10 @@ export async function dirUsage(dataRoot: string, sqlitePath: string): Promise<Us
+     } catch { /* 文件不存在（如未开 WAL 时 -wal 缺失）*/ }
+   }
+ 
++  const dbRelative = path.relative(dataRoot, sqlitePath)
+   await walkFiles(dataRoot, (filePath, size) => {
+     const rel = path.relative(dataRoot, filePath)
+-    if (rel === DB_FILE_BASE || rel.startsWith(DB_FILE_BASE + '-')) return // 已单独计入 db 桶
++    if (rel === dbRelative || rel === dbRelative + '-wal' || rel === dbRelative + '-shm') return // 已单独计入 db 桶
+     const parts = rel.split(path.sep)
+     if (parts[0] === 'static' && parts.length >= 2) {
+       const sub = parts[1]
+@@ -70,6 +72,17 @@ export async function dirUsage(dataRoot: string, sqlitePath: string): Promise<Us
+         return
+       }
+     }
++    // 导入的 ArcReel 素材保留原目录结构，不在 static/images 等标准目录下。
++    // 其原图、视频和历史版本按真实文件类型计数，避免全部显示为“其他”。
++    const ext = path.extname(filePath).toLowerCase()
++    if (IMAGE_EXTENSIONS.has(ext)) {
++      add('images', size)
++      return
++    }
++    if (VIDEO_EXTENSIONS.has(ext)) {
++      add('videos', size)
++      return
++    }
+     add('other', size)
+   })
+   return usage
